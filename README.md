@@ -47,7 +47,7 @@ WantedBy=multi-user.target
 | Concern | Behaviour |
 |---|---|
 | Books | Added on any device → stored in IndexedDB immediately, uploaded when the server is reachable, auto-downloaded to every other device on its next sync. |
-| Offline | App code cached by the service worker; books, positions, chats and keys live in IndexedDB. Everything except AI chat works with no network. Changes queue and sync on reconnect. |
+| Offline | App code cached by the service worker (network-first: latest code whenever the server answers within 3 s, saved copy otherwise); books, positions, chats and keys live in IndexedDB. Everything except AI chat works with no network. Changes queue and sync on reconnect. The top bar shows **Offline copy** when the app itself was loaded from the saved copy; **Settings → Connection & device** shows where the app was loaded from, whether the server is reachable now, and the last successful sync. |
 | Position | Each device keeps its **own** current page (saved as an EPUB CFI on every page turn/jump, not on resize or reopen, so it never drifts). The latest position from any device is synced: when another device has read more recently, you get "iPad is at p. 120 (ahead) — Jump"; nothing moves unless you tap Jump. A device opening a book for the first time starts at the latest position. |
 | Furthest read | Advances only on forward page turns, so a TOC/scrubber jump to the end doesn't count as "read". "Furthest read ›" appears when you're behind it; "↩ Back" returns you after any jump. |
 | Last book | Reopened automatically on load, on any device. |

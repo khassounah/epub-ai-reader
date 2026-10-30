@@ -1,8 +1,11 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '11';
+const APP_VERSION = '12';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
+// set by the service worker when this page came from the saved copy instead of the server
+const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
+const SAVED_AT = Number(document.querySelector('meta[name="reader-saved-at"]')?.content) || 0;
 console.info('Reader version', APP_VERSION);
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -130,10 +133,13 @@ function markDirty(kind, id) {
 
 // ---------------------------------------------------------------- sync
 let online = false, syncing = false, syncT = null, outboxKeys = new Set();
+const conn = { lastOk: 0, lastTry: 0, error: '' }; // server reachability as seen by sync
+const SYNC_TIMEOUT_MS = 10000;
 function setSyncStatus(s) {
   const n = $('#sync-status');
   n.className = s;
-  n.textContent = { syncing: 'Syncing…', synced: 'Synced', offline: 'Offline', pending: 'Pending sync' }[s] || '';
+  n.textContent = { syncing: 'Syncing…', synced: 'Synced', offline: LOADED_OFFLINE ? 'Offline copy' : 'Offline', pending: 'Pending sync' }[s] || '';
+  n.title = s === 'offline' ? `Server unreachable${conn.error ? ': ' + conn.error : ''}. Reading works; changes sync when it's back.` : '';
 }
 function scheduleSync(ms = 2500) { clearTimeout(syncT); syncT = setTimeout(sync, ms); }
 
@@ -171,7 +177,14 @@ async function sync() {
     for (const id of S.dirty.conversations) if (S.conversations[id]) { payload.conversations.push(S.conversations[id]); sent.conversations[id] = S.conversations[id].updatedAt; }
     for (const k of ['lastBook', 'settings']) if (S.dirty[k] && S[k]) { payload[k] = S[k]; sent[k] = S[k].updatedAt; }
 
-    const r = await fetch('/api/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    conn.lastTry = Date.now();
+    // a broken link (e.g. Tailscale down) can hang instead of failing; don't let sync wait forever
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), SYNC_TIMEOUT_MS);
+    let r;
+    try { r = await fetch('/api/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: ctrl.signal }); }
+    catch (e) { throw new Error(ctrl.signal.aborted ? `no answer from the server within ${SYNC_TIMEOUT_MS / 1000} s` : `can't reach the server (${e.message})`); }
+    finally { clearTimeout(to); }
     if (!r.ok) throw new Error('sync ' + r.status);
     const remote = await r.json();
 
@@ -182,15 +195,18 @@ async function sync() {
 
     applyRemote(remote);
     online = true;
+    Object.assign(conn, { lastOk: Date.now(), error: '' });
     setSyncStatus(outboxKeys.size ? 'pending' : 'synced');
     downloadMissing();
   } catch (e) {
     online = false;
+    conn.error = e.message;
     setSyncStatus('offline');
     console.warn('sync failed:', e.message);
   } finally {
     syncing = false;
     saveLocal();
+    if ($('#dlg-settings').open) renderConnection();
   }
 }
 
@@ -1345,20 +1361,36 @@ function openSettings() {
   $('#pref-size').value = S.prefs.fontSize;
   $('#pref-size-val').textContent = S.prefs.fontSize + '%';
   $('#pref-columns').value = S.prefs.columns || 'auto';
-  const swOk = 'serviceWorker' in navigator;
-  const offline = navigator.serviceWorker?.controller ? 'Offline: ready. The reader opens without the server.'
-    : !swOk ? (/iPad|iPhone/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent))
-      ? 'Offline: not supported in this browser. On iPad/iPhone use Safari (ideally Share → Add to Home Screen) to open the reader without the server.'
-      : 'Offline: unavailable. The page must be served over HTTPS (e.g. tailscale serve) or from localhost.')
-    : swError ? `Offline: this browser refused it (${swError}). On iPad/iPhone use Safari for offline reading.`
-    : 'Offline: not active yet. Reload once while connected.';
-  $('#device-info').replaceChildren(
-    el('div', {}, `Reader version ${APP_VERSION}${BUILD ? ` (build ${BUILD})` : ''} · ${deviceName()} · device ${S.deviceId}`),
-    el('div', {}, offline + ' Books, positions and chats are stored on this device either way.'),
-    el('button', { type: 'button', class: 'btn small', style: 'margin-top:6px', onclick: hardReload, title: 'Clears the saved copy of the app and loads it fresh from the server. Your books and data stay.' }, 'Reload app from server'));
+  renderConnection();
   renderProviders();
   $('#dlg-settings').showModal();
 }
+const ago = (t) => {
+  if (!t) return 'never';
+  const sec = Math.round((Date.now() - t) / 1000);
+  return sec < 60 ? `${sec} s ago` : sec < 3600 ? `${Math.round(sec / 60)} min ago` : new Date(t).toLocaleString();
+};
+function renderConnection() {
+  const row = (label, value, cls) => el('div', { class: 'conn-row' }, el('span', { class: 'conn-label' }, label), el('span', { class: 'conn-val ' + (cls || '') }, value));
+  const loaded = LOADED_OFFLINE
+    ? row('App loaded from', `Offline copy (saved ${SAVED_AT ? ago(SAVED_AT) : 'earlier'}). The server didn't answer when this page loaded.`, 'warn')
+    : row('App loaded from', 'Server', 'ok');
+  const server = syncing && !conn.lastOk && !conn.error ? row('Server now', 'Checking…')
+    : online ? row('Server now', `Reachable · last sync ${ago(conn.lastOk)}`, 'ok')
+    : row('Server now', `Unreachable${conn.error ? ` (${conn.error})` : ''} · last successful sync ${ago(conn.lastOk)}`, 'warn');
+  const swOk = 'serviceWorker' in navigator;
+  const offlineReady = navigator.serviceWorker?.controller ? row('Offline reading', 'Ready: the reader opens without the server', 'ok')
+    : row('Offline reading', !swOk ? 'Not available: needs HTTPS (e.g. tailscale serve) or localhost, and a browser that supports it'
+      : swError ? `Not available in this browser (${swError})` : 'Not active yet: reload once while connected', 'warn');
+  $('#device-info').replaceChildren(
+    loaded, server, offlineReady,
+    row('Version', `${APP_VERSION}${BUILD ? ` (build ${BUILD})` : ''}`),
+    row('This device', `${deviceName()} · ${S.deviceId} · ${location.host}`),
+    el('div', { class: 'conn-actions' },
+      el('button', { type: 'button', class: 'btn small', onclick: () => { renderConnection(); sync(); } }, 'Check connection'),
+      el('button', { type: 'button', class: 'btn small', onclick: hardReload, title: 'Clears the saved copy of the app and loads it fresh from the server. Your books and data stay.' }, 'Reload app from server')));
+}
+
 function renderProviders() {
   const box = $('#provider-list');
   if (!editProviders.length) { box.replaceChildren(el('p', { class: 'hint' }, 'No providers yet. Add one below.')); return; }

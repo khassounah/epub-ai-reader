@@ -211,3 +211,13 @@ dialog::backdrop { background: rgba(0,0,0,0.35); }
   #book-title { display: none; }
   #topbar { justify-content: space-between; }
 }
+
+/* settings: connection panel */
+#device-info { display: grid; gap: 4px; font-size: 13px; color: var(--ink); margin: 0; }
+.conn-row { display: grid; grid-template-columns: 130px 1fr; gap: 8px; }
+.conn-label { color: var(--muted); }
+.conn-val.ok::before { content: "● "; color: #2e8b57; }
+.conn-val.warn::before { content: "● "; color: #c77d1a; }
+.conn-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+#sync-status.offline { cursor: help; }
+@media (max-width: 520px) { .conn-row { grid-template-columns: 1fr; gap: 0; } }
