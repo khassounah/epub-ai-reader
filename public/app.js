@@ -1,6 +1,8 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
+const APP_VERSION = '10';
+console.info('Reader version', APP_VERSION);
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 function el(tag, attrs = {}, ...kids) {
@@ -1330,7 +1332,7 @@ function openSettings() {
   $('#pref-size-val').textContent = S.prefs.fontSize + '%';
   $('#pref-columns').value = S.prefs.columns || 'auto';
   const swOk = 'serviceWorker' in navigator;
-  $('#device-info').textContent = `Device ${S.deviceId}. ${swOk ? 'Offline app cache is active.' : 'Offline app cache unavailable: this page must be served over HTTPS (e.g. tailscale serve) or from localhost. Your books and progress still stay on this device, but the app itself can’t load without the server.'}`;
+  $('#device-info').textContent = `Reader version ${APP_VERSION} · ${deviceName()} · device ${S.deviceId}. ${swOk ? 'Offline app cache is active.' : 'Offline app cache unavailable: this page must be served over HTTPS (e.g. tailscale serve) or from localhost. Your books and progress still stay on this device, but the app itself can’t load without the server.'}`;
   renderProviders();
   $('#dlg-settings').showModal();
 }
