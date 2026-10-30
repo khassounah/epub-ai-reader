@@ -1,7 +1,7 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '13';
+const APP_VERSION = '15';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 // set by the service worker when this page came from the saved copy instead of the server
 const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
@@ -838,27 +838,31 @@ function attachContentHandlers(contents) {
   const doc = contents.document;
   let x0 = null, y0 = null, t0 = 0;
   doc.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now(); }, { passive: true });
-  doc.addEventListener('touchend', (e) => {
-    if (x0 == null) return;
-    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
-    x0 = null;
-    if (doc.getSelection()?.toString()) return;
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && Date.now() - t0 < 800) dx < 0 ? next() : prev();
-  }, { passive: true });
-  doc.addEventListener('mousedown', () => hideSelectionPop());
-  doc.addEventListener('click', (e) => {
+  // Images open in the viewer. Handled on tap (touchend) as well as click: iOS only sends "click"
+  // for elements it considers clickable, so a tap on a plain <img> would otherwise do nothing.
+  const openImage = (e) => {
     const img = e.target.closest?.('img, image');
-    if (!img || e.target.closest('a[href]') || doc.getSelection()?.toString()) return;
+    if (!img || e.target.closest('a[href]') || doc.getSelection()?.toString()) return false;
     const r = img.getBoundingClientRect();
-    if (r.width < 40 && r.height < 40) return; // inline icons, bullets
+    if (r.width < 40 && r.height < 40) return false; // inline icons, bullets
     const src = img.localName === 'image' ? (img.getAttribute('href') || img.getAttribute('xlink:href') || img.getAttributeNS('http://www.w3.org/1999/xlink', 'href')) : img.currentSrc || img.src;
-    if (!src) return;
-    e.preventDefault();
-    e.stopPropagation();
+    if (!src) return false;
     const fig = img.closest('figure');
     const caption = (fig?.querySelector('figcaption')?.textContent || img.getAttribute('alt') || img.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
     openLightbox(new URL(src, doc.baseURI).href, caption);
-  });
+    return true;
+  };
+  doc.addEventListener('touchend', (e) => {
+    if (x0 == null) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+    const dt = Date.now() - t0;
+    x0 = null;
+    if (doc.getSelection()?.toString()) return;
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 500 && openImage(e)) { e.preventDefault(); return; } // tap; no follow-up click
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 800) dx < 0 ? next() : prev();
+  }, { passive: false });
+  doc.addEventListener('mousedown', () => hideSelectionPop());
+  doc.addEventListener('click', (e) => { if (openImage(e)) { e.preventDefault(); e.stopPropagation(); } });
   doc.addEventListener('selectionchange', () => { if (!doc.getSelection()?.toString().trim()) hideSelectionPop(); });
 }
 
@@ -1443,117 +1447,24 @@ function saveSettings() {
 }
 
 // ---------------------------------------------------------------- image viewer
-// Full-screen view of a book image: wheel / pinch / double-click to zoom, drag to pan.
-const lb = { scale: 1, fit: 1, x: 0, y: 0, w: 0, h: 0, pointers: new Map(), pinch: null, drag: null, lastTap: 0 };
-function lbApply() {
-  $('#lb-img').style.transform = `translate(${lb.x}px, ${lb.y}px) scale(${lb.scale})`;
-  $('#lb-zoom').textContent = Math.round(lb.scale * 100) + '%';
-}
-function lbClamp() {
-  const st = $('#lb-stage').getBoundingClientRect();
-  const iw = lb.w * lb.scale, ih = lb.h * lb.scale;
-  // centred when smaller than the screen; otherwise no empty space at the edges
-  lb.x = iw <= st.width ? (st.width - iw) / 2 : Math.min(0, Math.max(st.width - iw, lb.x));
-  lb.y = ih <= st.height ? (st.height - ih) / 2 : Math.min(0, Math.max(st.height - ih, lb.y));
-}
-function lbZoomTo(scale, cx, cy) {
-  const st = $('#lb-stage').getBoundingClientRect();
-  cx ??= st.width / 2; cy ??= st.height / 2;
-  scale = Math.min(Math.max(scale, Math.min(lb.fit, 1) * 0.5), Math.max(8, lb.fit * 4));
-  // keep the point under the cursor/fingers fixed
-  lb.x = cx - ((cx - lb.x) * scale) / lb.scale;
-  lb.y = cy - ((cy - lb.y) * scale) / lb.scale;
-  lb.scale = scale;
-  lbClamp();
-  lbApply();
-}
-function lbFit() {
-  const st = $('#lb-stage').getBoundingClientRect();
-  lb.fit = Math.min((st.width - 24) / lb.w, (st.height - 24) / lb.h, 2); // small images are enlarged up to 2x
-  lb.scale = lb.fit;
-  lbClamp();
-  lbApply();
-}
+// Full-screen view of a book image. Sizing is CSS: natural size when it fits, scaled down when larger.
 async function openLightbox(src, caption) {
   const img = $('#lb-img');
   img.src = src;
   $('#lb-caption').textContent = caption;
   $('#lightbox').hidden = false;
-  try { await img.decode(); } catch { $('#lightbox').hidden = true; toast("Couldn't open that image."); return; }
-  lb.w = img.naturalWidth || 300;
-  lb.h = img.naturalHeight || 300;
-  lbFit();
+  try { await img.decode(); } catch { closeLightbox(); toast("Couldn't open that image."); }
 }
-function closeLightbox() { $('#lightbox').hidden = true; $('#lb-img').removeAttribute('src'); lb.pointers.clear(); }
-
+function closeLightbox() { $('#lightbox').hidden = true; $('#lb-img').removeAttribute('src'); }
 function wireLightbox() {
-  const stage = $('#lb-stage');
-  $('#lb-close').onclick = closeLightbox;
-  $('#lb-fit').onclick = lbFit;
-  $('#lb-actual').onclick = () => lbZoomTo(1);
-  const local = (e) => { const r = stage.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
-  stage.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const [cx, cy] = local(e);
-    lbZoomTo(lb.scale * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0018)), cx, cy); // ctrlKey = trackpad pinch
-  }, { passive: false });
-  stage.addEventListener('pointerdown', (e) => {
-    stage.setPointerCapture(e.pointerId);
-    lb.pointers.set(e.pointerId, local(e));
-    if (lb.pointers.size === 2) {
-      const [a, b] = [...lb.pointers.values()];
-      lb.pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), scale: lb.scale };
-      lb.drag = null;
-    } else {
-      lb.drag = { x: e.clientX, y: e.clientY, ox: lb.x, oy: lb.y, moved: false };
-      stage.classList.add('dragging');
-    }
-  });
-  stage.addEventListener('pointermove', (e) => {
-    if (!lb.pointers.has(e.pointerId)) return;
-    lb.pointers.set(e.pointerId, local(e));
-    if (lb.pinch && lb.pointers.size === 2) {
-      const [a, b] = [...lb.pointers.values()];
-      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
-      lbZoomTo(lb.pinch.scale * (d / lb.pinch.d), (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
-    } else if (lb.drag) {
-      const dx = e.clientX - lb.drag.x, dy = e.clientY - lb.drag.y;
-      if (Math.abs(dx) + Math.abs(dy) > 4) lb.drag.moved = true;
-      lb.x = lb.drag.ox + dx; lb.y = lb.drag.oy + dy;
-      lbClamp(); lbApply();
-    }
-  });
-  const end = (e) => {
-    const wasTap = lb.drag && !lb.drag.moved && lb.pointers.size === 1;
-    lb.pointers.delete(e.pointerId);
-    if (lb.pointers.size < 2) lb.pinch = null;
-    if (!lb.pointers.size) { stage.classList.remove('dragging'); lb.drag = null; }
-    if (!wasTap) return;
-    const [cx, cy] = local(e);
-    const now = Date.now();
-    if (now - lb.lastTap < 300) { // double tap / double click: toggle fit <-> zoomed in
-      lb.lastTap = 0;
-      if (lb.scale > lb.fit * 1.05) lbFit(); else lbZoomTo(Math.max(lb.fit * 2.5, 1), cx, cy);
-      return;
-    }
-    lb.lastTap = now;
-    // single tap on the backdrop (outside the image) closes
-    const r = $('#lb-img').getBoundingClientRect();
-    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
-      setTimeout(() => { if (lb.lastTap === now) closeLightbox(); }, 300);
-    }
-  };
-  stage.addEventListener('pointerup', end);
-  stage.addEventListener('pointercancel', end);
+  const box = $('#lightbox');
+  box.addEventListener('click', closeLightbox);
+  // iOS: a tap on a plain element doesn't produce "click"; close on the tap itself, and cancel the
+  // follow-up click so it can't land on the page underneath (re-opening the image or turning a page)
+  box.addEventListener('touchend', (e) => { e.preventDefault(); closeLightbox(); }, { passive: false });
   document.addEventListener('keydown', (e) => {
-    if ($('#lightbox').hidden) return;
-    if (e.key === 'Escape') { e.stopPropagation(); closeLightbox(); }
-    else if (e.key === '+' || e.key === '=') lbZoomTo(lb.scale * 1.25);
-    else if (e.key === '-') lbZoomTo(lb.scale / 1.25);
-    else if (e.key === '0') lbFit();
-    else if (e.key === '1') lbZoomTo(1);
+    if (!$('#lightbox').hidden && e.key === 'Escape') { e.stopPropagation(); closeLightbox(); }
   }, true);
-  window.addEventListener('resize', () => { if (!$('#lightbox').hidden) lbFit(); });
 }
 
 // ---------------------------------------------------------------- UI chrome

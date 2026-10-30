@@ -146,15 +146,9 @@
     </form>
   </dialog>
 
-  <div id="lightbox" hidden role="dialog" aria-label="Image viewer">
+  <div id="lightbox" hidden role="dialog" aria-label="Image viewer" title="Click to close">
     <div id="lb-stage"><img id="lb-img" alt=""></div>
-    <div id="lb-bar">
-      <span id="lb-caption" class="truncate"></span>
-      <span id="lb-zoom"></span>
-      <button id="lb-fit" class="lb-btn" title="Fit to screen (0)">Fit</button>
-      <button id="lb-actual" class="lb-btn" title="Actual size (1)">1:1</button>
-      <button id="lb-close" class="lb-btn" title="Close (Esc)" aria-label="Close">✕</button>
-    </div>
+    <div id="lb-caption"></div>
   </div>
   <div id="toast" hidden></div>
   <div id="drop-overlay" hidden>Drop EPUB files to add them</div>
