@@ -1,6 +1,6 @@
 // App-shell cache so the reader loads with no server connection.
 // Books, progress and chats live in IndexedDB; this only caches the code.
-const CACHE = 'reader-shell-v7';
+const CACHE = 'reader-shell-v8';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/manifest.json', '/icon.svg', '/lib/epub.min.js', '/lib/jszip.min.js'];
 
 self.addEventListener('install', (e) => {

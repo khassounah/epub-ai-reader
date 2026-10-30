@@ -86,17 +86,32 @@ function mergeConv(a, b) {
 const freshState = () => ({
   deviceId: null,
   books: {}, deleted: {}, progress: {}, lastBook: null, conversations: {},
+  here: {}, // bookId -> this device's own position { cfi, percent, page, chapter, updatedAt }; never synced
   settings: { providers: [], defaultProviderId: null, updatedAt: 0 },
   prefs: { theme: 'light', fontSize: 100, updatedAt: 0 },
   dirty: { progress: [], conversations: [], lastBook: false, settings: false, prefs: false },
 });
 let S = freshState();
 
+// This device's position in a book; a device that has never opened it starts where you last read anywhere.
+const here = (id) => S.here[id] || S.progress[id] || null;
+function deviceName() {
+  const ua = navigator.userAgent;
+  if (/iPad|Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return 'iPad';
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? 'Android phone' : 'Android tablet';
+  if (/Mac/.test(ua)) return 'Mac';
+  if (/Windows/.test(ua)) return 'Windows PC';
+  if (/Linux|X11|CrOS/.test(ua)) return 'Linux laptop';
+  return 'another device';
+}
+
 async function loadLocal() {
   const saved = (await idb.get('kv', 'state')) || {};
   S = { ...freshState(), ...saved };
   S.dirty = { ...freshState().dirty, ...(saved.dirty || {}) };
   if (!S.deviceId) S.deviceId = uid().slice(0, 10);
+  S.here ||= {};
 }
 let saveT;
 function saveLocal() {
@@ -151,7 +166,7 @@ async function sync() {
     const payload = { progress: {}, conversations: [] };
     for (const id of S.dirty.progress) if (S.progress[id]) { payload.progress[id] = S.progress[id]; sent.progress[id] = S.progress[id].updatedAt; }
     for (const id of S.dirty.conversations) if (S.conversations[id]) { payload.conversations.push(S.conversations[id]); sent.conversations[id] = S.conversations[id].updatedAt; }
-    for (const k of ['lastBook', 'settings', 'prefs']) if (S.dirty[k] && S[k]) { payload[k] = S[k]; sent[k] = S[k].updatedAt; }
+    for (const k of ['lastBook', 'settings']) if (S.dirty[k] && S[k]) { payload[k] = S[k]; sent[k] = S[k].updatedAt; }
 
     const r = await fetch('/api/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     if (!r.ok) throw new Error('sync ' + r.status);
@@ -160,7 +175,7 @@ async function sync() {
     // clear dirty flags only for items unchanged since we sent them
     S.dirty.progress = S.dirty.progress.filter((id) => S.progress[id]?.updatedAt !== sent.progress[id]);
     S.dirty.conversations = S.dirty.conversations.filter((id) => S.conversations[id]?.updatedAt !== sent.conversations[id]);
-    for (const k of ['lastBook', 'settings', 'prefs']) if (S.dirty[k] && S[k]?.updatedAt === sent[k]) S.dirty[k] = false;
+    for (const k of ['lastBook', 'settings']) if (S.dirty[k] && S[k]?.updatedAt === sent[k]) S.dirty[k] = false;
 
     applyRemote(remote);
     online = true;
@@ -177,6 +192,17 @@ async function sync() {
 }
 
 let lastRemoteNotice = 0;
+// Another device read this book more recently than this one: offer to jump there (never move on our own).
+function offerOtherDevice() {
+  const p = S.progress[currentBookId], mine = S.here[currentBookId];
+  if (!p?.cfi || p.device === S.deviceId || !locationsReady || !currentLoc) return;
+  if (p.updatedAt <= (mine?.updatedAt || 0) || p.updatedAt <= lastRemoteNotice) return;
+  const theirs = book.locations.locationFromCfi(p.cfi), ours = book.locations.locationFromCfi(currentLoc.start.cfi);
+  if (Math.abs(theirs - ours) <= 1) return;
+  lastRemoteNotice = p.updatedAt;
+  const where = p.page ? `p. ${p.page}` : pctStr(p.percent);
+  toast(`${p.deviceName || 'Another device'} is at ${where} (${theirs > ours ? 'ahead' : 'behind'})`, 'Jump', () => jumpTo(p.cfi), 15000);
+}
 function applyRemote(R) {
   // books
   const remoteIds = new Set(R.books.map((b) => b.id));
@@ -194,18 +220,10 @@ function applyRemote(R) {
   S.lastBook = newer(S.lastBook, R.lastBook);
   const oldSettings = S.settings.updatedAt;
   S.settings = newer(S.settings, R.settings) || S.settings;
-  S.prefs = newer(S.prefs, R.prefs) || S.prefs;
-  applyPrefs();
   if (S.settings.updatedAt !== oldSettings) renderProviderSelect();
 
-  // another device moved further while this book is open → offer to jump
   if (currentBookId && currentLoc) {
-    const p = S.progress[currentBookId];
-    const samePage = locationsReady && p?.cfi && Math.abs(book.locations.locationFromCfi(p.cfi) - book.locations.locationFromCfi(currentLoc.start.cfi)) <= 1;
-    if (p && p.device !== S.deviceId && !samePage && p.cfi !== currentLoc.start.cfi && p.updatedAt > lastLocalNav && p.updatedAt > lastRemoteNotice) {
-      lastRemoteNotice = p.updatedAt;
-      toast(`Another device is at ${p.page ? 'p. ' + p.page : pctStr(p.percent)}`, 'Jump', () => jumpTo(p.cfi));
-    }
+    offerOtherDevice();
     refreshAnnotations();
   }
   renderLibrary();
@@ -414,6 +432,7 @@ async function addFiles(files) {
 async function removeLocalBook(id, queueDelete = true) {
   delete S.books[id];
   delete S.progress[id];
+  delete S.here[id];
   S.deleted[id] = Date.now();
   for (const c of Object.values(S.conversations)) if (c.bookId === id) Object.assign(c, { deleted: true, updatedAt: Date.now() });
   await idb.del('files', id).catch(() => {});
@@ -435,7 +454,7 @@ async function renderLibrary() {
   const books = Object.values(S.books).sort((a, b) => (S.progress[b.id]?.updatedAt || b.addedAt) - (S.progress[a.id]?.updatedAt || a.addedAt));
   if (!books.length) list.append(el('li', { class: 'hint' }, 'No books yet.'));
   for (const b of books) {
-    const p = S.progress[b.id] || {};
+    const p = { ...(S.progress[b.id] || {}), percent: here(b.id)?.percent };
     const cover = await idb.get('kv', 'cover:' + b.id).catch(() => null);
     list.append(el('li', { class: b.id === currentBookId ? 'current' : '', onclick: () => { closeDrawers(); openBook(b.id); } },
       el('div', { class: 'cover' }, cover ? el('img', { src: cover, alt: '' }) : '📖'),
@@ -507,7 +526,11 @@ async function openBook(id) {
   rendition.on('selected', onSelected);
   rendition.on('keyup', onKey);
 
-  const p = S.progress[id];
+  if (!S.here[id] && S.progress[id]?.cfi) {
+    const r = S.progress[id];
+    S.here[id] = { cfi: r.cfi, percent: r.percent, page: r.page, totalPages: r.totalPages, chapter: r.chapter, updatedAt: 0 };
+  }
+  const p = here(id);
   lastLocalNav = Date.now();
   try {
     await rendition.display(p?.cfi || undefined);
@@ -563,6 +586,7 @@ async function openBook(id) {
   $('#scrubber').disabled = false;
   saveProgress(true);
   updateStatus();
+  offerOtherDevice();
 }
 
 function registerThemes() {
@@ -578,6 +602,13 @@ function registerThemes() {
     body: { ...base, background: '#1a1a19 !important', color: '#e3dfd6 !important' },
     'a, a:link, a:visited': { color: '#8cc7b2 !important' },
     '*': { 'border-color': '#444 !important' },
+    // light boxes (code blocks, tables, call-outs): invert so they become dark with light text,
+    // keeping the hues of syntax highlighting; images inside are inverted back
+    '.rd-invert': { filter: 'invert(1) hue-rotate(180deg) !important', color: '#1d1c1a !important' },
+    '.rd-invert, .rd-invert *': { 'border-color': '#cfcfcf !important' },
+    '.rd-invert img, .rd-invert svg, .rd-invert video, .rd-invert picture': { filter: 'invert(1) hue-rotate(180deg) !important' },
+    // dark text sitting directly on the dark page: same hue, made light
+    '.rd-lighten': { color: 'var(--rd-fg) !important' },
   });
 }
 
@@ -590,6 +621,7 @@ function applyPrefs() {
     const hadPrefs = !!rendition._appliedPrefs;
     rendition._appliedPrefs = key;
     rendition.themes.select(t);
+    for (const c of rendition.getContents()) fixContrast(c);
     rendition.themes.fontSize((S.prefs.fontSize || 100) + '%');
     if (hadPrefs) requestRelayout(0); // text size / columns reflow: keep the same first line
     else applyColumns();
@@ -620,7 +652,7 @@ function requestRelayout(delay = 150) {
 async function relayout() {
   if (!rendition?.manager || !currentBookId) return;
   const r = rendition;
-  const anchor = S.progress[currentBookId]?.cfi || currentLoc?.start.cfi;
+  const anchor = here(currentBookId)?.cfi || currentLoc?.start.cfi;
   applyColumns();
   r.manager._stageSize = undefined; // always re-measure; a stale cached size skipped real resizes
   r.manager.resize(undefined, undefined, anchor); // re-renders views at the container's real size
@@ -724,7 +756,51 @@ function applyColumns() {
   return true;
 }
 
+// ---------------------------------------------------------------- dark-mode contrast
+// Books style some elements for a white page (code blocks with a white background, black text set in
+// the book's CSS). In dark mode: elements with a light background are inverted as a unit; dark text
+// directly on the page is lightened keeping its hue. Only classes and a CSS variable are added, so
+// CFIs (positions, highlights) are unaffected.
+function parseRgb(c) {
+  const m = /rgba?\(([^)]+)\)/.exec(c || '');
+  if (!m) return null;
+  const [r, g, b, a = 1] = m[1].split(/[ ,/]+/).filter(Boolean).map(Number);
+  return { r, g, b, a };
+}
+const luminance = ({ r, g, b }) => (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+function lightened({ r, g, b }) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, dlt = max - min;
+  let h = 0, sat = 0;
+  if (dlt) {
+    sat = dlt / (1 - Math.abs(2 * l - 1));
+    h = max === r ? ((g - b) / dlt) % 6 : max === g ? (b - r) / dlt + 2 : (r - g) / dlt + 4;
+    h = (h * 60 + 360) % 360;
+  }
+  return sat < 0.08 ? '#e3dfd6' : `hsl(${Math.round(h)} ${Math.round(Math.min(sat, 0.65) * 100)}% 72%)`;
+}
+function fixContrast(contents) {
+  const doc = contents?.document;
+  if (!doc?.body) return;
+  for (const e of doc.querySelectorAll('.rd-invert, .rd-lighten')) { e.classList.remove('rd-invert', 'rd-lighten'); e.style.removeProperty('--rd-fg'); }
+  if ((S.prefs.theme || 'light') !== 'dark') return;
+  const win = doc.defaultView;
+  const skip = /^(img|svg|image|video|canvas|picture|math|br|hr)$/i;
+  for (const e of doc.body.querySelectorAll('*')) {
+    if (skip.test(e.localName) || e.parentElement?.closest('.rd-invert')) continue; // inside an inverted box: handled by it
+    const cs = win.getComputedStyle(e);
+    const bg = parseRgb(cs.backgroundColor);
+    if (bg && bg.a > 0.3 && luminance(bg) > 0.55) { e.classList.add('rd-invert'); continue; }
+    const fg = parseRgb(cs.color);
+    if (fg && luminance(fg) < 0.45 && [...e.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) {
+      e.style.setProperty('--rd-fg', lightened(fg));
+      e.classList.add('rd-lighten');
+    }
+  }
+}
+
 function attachContentHandlers(contents) {
+  requestAnimationFrame(() => fixContrast(contents));
   const doc = contents.document;
   let x0 = null, y0 = null, t0 = 0;
   doc.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now(); }, { passive: true });
@@ -789,21 +865,28 @@ function currentChapter() {
 // saving those would make the position creep backwards on every reload.
 function saveProgress(force = false) {
   if (!currentLoc || !currentBookId) return;
-  const p = S.progress[currentBookId] || {};
+  const p = S.progress[currentBookId] || {};          // synced: latest position anywhere + furthest
+  const mine = S.here[currentBookId] || null;          // this device only
   if (!navSource && !force) return;
-  const cfi = !navSource && p.cfi ? p.cfi : currentLoc.start.cfi;
+  const cfi = !navSource && mine?.cfi ? mine.cfi : (!navSource && !mine && p.cfi ? p.cfi : currentLoc.start.cfi);
   const pct = locationsReady ? book.locations.percentageFromCfi(cfi) : null;
-  const page = locationsReady ? book.locations.locationFromCfi(cfi) + 1 : p.page;
+  const page = locationsReady ? book.locations.locationFromCfi(cfi) + 1 : mine?.page;
   const updateFurthest = locationsReady && pct != null && pct > (p.furthestPercent ?? -1) && (navSource === 'turn' || p.furthestPercent == null);
+  const userMoved = !!navSource;
   navSource = null;
-  if (p.cfi === cfi && !force && !updateFurthest) return;
-  const np = {
-    ...p, cfi, percent: pct ?? p.percent ?? 0, page, totalPages: locationsReady ? book.locations.total : p.totalPages,
-    chapter: currentChapter(), updatedAt: p.cfi === cfi ? (p.updatedAt || Date.now()) : Date.now(), device: S.deviceId,
-  };
-  if (updateFurthest) Object.assign(np, { furthestCfi: cfi, furthestPercent: pct, furthestChapter: np.chapter });
-  S.progress[currentBookId] = np;
-  markDirty('progress', currentBookId);
+  const pos = { cfi, percent: pct ?? mine?.percent ?? 0, page, totalPages: locationsReady ? book.locations.total : mine?.totalPages, chapter: currentChapter() };
+  const moved = mine?.cfi !== cfi;
+  if (!moved && !updateFurthest && !(force && mine && mine.page !== pos.page)) return;
+  // a position only becomes "latest" (shown to other devices) when the user actually moved here
+  const stamp = moved && (userMoved || !mine) ? Date.now() : (mine?.updatedAt || 0);
+  S.here[currentBookId] = { ...pos, updatedAt: stamp };
+  if (userMoved || updateFurthest) {
+    const np = { ...p };
+    if (userMoved) Object.assign(np, pos, { updatedAt: Date.now(), device: S.deviceId, deviceName: deviceName() });
+    if (updateFurthest) Object.assign(np, { furthestCfi: cfi, furthestPercent: pct, furthestChapter: pos.chapter });
+    S.progress[currentBookId] = np;
+    markDirty('progress', currentBookId);
+  } else saveLocal();
 }
 
 function updateStatus() {
@@ -817,7 +900,7 @@ function updateStatus() {
     if (document.activeElement !== $('#scrubber')) $('#scrubber').value = Math.round((currentPercent() || 0) * 1000);
   } else if (!$('#page-info').textContent.startsWith('Counting')) $('#page-info').textContent = chap.slice(3);
   const far = p?.furthestPercent;
-  const showFar = locationsReady && far != null && p.furthestCfi && far - Math.max(p.percent || 0, currentPercent() || 0) > 0.004;
+  const showFar = locationsReady && far != null && p.furthestCfi && far - Math.max(here(currentBookId)?.percent || 0, currentPercent() || 0) > 0.004;
   $('#btn-furthest').hidden = !showFar;
   if (showFar) $('#btn-furthest').textContent = `Furthest read (${pctStr(far)}) ›`;
 }
@@ -1242,8 +1325,8 @@ function saveSettings() {
   markDirty('settings');
   const theme = $('#pref-theme').value, size = +$('#pref-size').value, columns = $('#pref-columns').value;
   if (theme !== S.prefs.theme || size !== S.prefs.fontSize || columns !== (S.prefs.columns || 'auto')) {
-    S.prefs = { theme, fontSize: size, columns, updatedAt: Date.now() };
-    markDirty('prefs');
+    S.prefs = { theme, fontSize: size, columns, updatedAt: Date.now() }; // this device only
+    saveLocal();
     applyPrefs();
   }
   renderProviderSelect();
