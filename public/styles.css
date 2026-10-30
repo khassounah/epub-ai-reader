@@ -223,8 +223,11 @@ dialog::backdrop { background: rgba(0,0,0,0.35); }
 @media (max-width: 520px) { .conn-row { grid-template-columns: 1fr; gap: 0; } }
 
 /* image viewer: 1:1 when it fits, scaled down to fit when larger; any click closes */
-#lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(10, 10, 10, 0.92); display: flex; flex-direction: column; cursor: zoom-out; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+#lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(10, 10, 10, 0.92); display: flex; flex-direction: column; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 #lb-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
 #lb-img { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; background: #fff; user-select: none; -webkit-user-drag: none; }
 #lb-caption { color: #ddd; font-size: 13px; text-align: center; padding: 0 16px 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 #lb-caption:empty { display: none; }
+
+#diag-log { max-height: 220px; overflow: auto; font-size: 11px; line-height: 1.45; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; white-space: pre-wrap; margin: 0; }
+.settings summary { cursor: pointer; font-weight: 600; margin: 10px 0 6px; }

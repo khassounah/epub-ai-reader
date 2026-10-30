@@ -1,12 +1,25 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '15';
+const APP_VERSION = '16';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 // set by the service worker when this page came from the saved copy instead of the server
 const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
 const SAVED_AT = Number(document.querySelector('meta[name="reader-saved-at"]')?.content) || 0;
 console.info('Reader version', APP_VERSION);
+// Diagnostics: recent events/errors, shown in Settings (tablets have no developer console)
+const diagLog = [];
+function diag(msg) {
+  diagLog.push(`${new Date().toLocaleTimeString()} ${msg}`);
+  if (diagLog.length > 60) diagLog.shift();
+  if (document.querySelector('#dlg-settings')?.open) renderDiag();
+}
+for (const level of ['warn', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => { diag(`${level}: ${a.map((x) => (x instanceof Error ? x.message : typeof x === 'object' ? JSON.stringify(x)?.slice(0, 200) : String(x))).join(' ')}`); orig(...a); };
+}
+window.addEventListener('error', (e) => diag(`error: ${e.message}`));
+window.addEventListener('unhandledrejection', (e) => diag(`unhandled: ${e.reason?.message || e.reason}`));
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 function el(tag, attrs = {}, ...kids) {
@@ -548,8 +561,13 @@ async function openBook(id) {
   document.title = meta.title;
 
   book = ePub(await blob.arrayBuffer());
+  book.spine.hooks.content.register(neutralizeBookScripts);
   const thisOpen = book._rdKey = id + ':' + Date.now();
-  rendition = book.renderTo('viewer', { width: '100%', height: '100%', flow: 'paginated', spread: 'auto', allowScriptedContent: false });
+  // allowScriptedContent: WebKit (every iPad/iPhone browser, and Safari) won't run *any* event listener
+  // inside a frame sandboxed without allow-scripts, including the reader's own (taps, swipes, text
+  // selection). So the frame allows scripts, and the book's own code is neutralized before display
+  // by neutralizeBookScripts below.
+  rendition = book.renderTo('viewer', { width: '100%', height: '100%', flow: 'paginated', spread: 'auto', allowScriptedContent: true });
   registerThemes();
   applyPrefs();
 
@@ -622,13 +640,42 @@ async function openBook(id) {
   offerOtherDevice();
 }
 
+// Disarm code inside the EPUB before a chapter is displayed: scripts get a non-executable type, inline
+// event handlers and javascript: URLs are removed, embedded frames are fully sandboxed, plugins lose
+// their source, and a CSP forbids scripts. Elements are kept in place (not deleted) so CFIs, i.e. saved
+// positions and highlights, stay identical.
+function neutralizeBookScripts(doc) {
+  try {
+    for (const sc of doc.querySelectorAll('script')) {
+      sc.setAttribute('type', 'application/x-reader-disabled');
+      sc.removeAttribute('src'); sc.removeAttribute('href'); sc.removeAttribute('xlink:href');
+      sc.textContent = '';
+    }
+    for (const e of doc.querySelectorAll('*')) {
+      for (const a of [...e.attributes]) {
+        if (/^on/i.test(a.name) || /^\s*(javascript|vbscript|data:text\/html)/i.test(a.value)) e.removeAttributeNode(a);
+      }
+      const n = e.localName;
+      if (n === 'iframe' || n === 'frame') e.setAttribute('sandbox', '');
+      else if (n === 'object' || n === 'embed' || n === 'applet') { e.removeAttribute('data'); e.removeAttribute('src'); }
+    }
+    const head = doc.querySelector('head');
+    if (head) {
+      const m = doc.createElementNS(head.namespaceURI || 'http://www.w3.org/1999/xhtml', 'meta');
+      m.setAttribute('http-equiv', 'Content-Security-Policy');
+      m.setAttribute('content', "script-src 'none'; object-src 'none'");
+      head.insertBefore(m, head.firstChild);
+    }
+  } catch (e) { console.warn('neutralize', e); }
+}
+
 function registerThemes() {
   // orphans/widows 1: lines fill columns exactly, so the anchor spacer below lands lines precisely.
   rendition.themes.default({
     'html, body': { orphans: '1 !important', widows: '1 !important' },
     '[data-rd-anchor]::before': { content: '""', display: 'block', height: 'var(--rd-gap, 0px)' },
   });
-  rendition.themes.default({ 'img, svg image': { cursor: 'zoom-in' } });
+  rendition.themes.default({ 'img, svg image': { cursor: 'pointer' } }); // cursor:pointer also makes iOS send taps as clicks
   const base = { 'line-height': '1.6' };
   rendition.themes.register('light', { body: { ...base, background: '#fbfaf7 !important', color: '#1d1c1a !important' } });
   rendition.themes.register('sepia', { body: { ...base, background: '#f6ecd6 !important', color: '#3b2f22 !important' } });
@@ -842,11 +889,15 @@ function attachContentHandlers(contents) {
   // for elements it considers clickable, so a tap on a plain <img> would otherwise do nothing.
   const openImage = (e) => {
     const img = e.target.closest?.('img, image');
-    if (!img || e.target.closest('a[href]') || doc.getSelection()?.toString()) return false;
+    if (!img) return false;
+    const why = (r) => { diag(`${e.type} on image ignored: ${r}`); return false; };
+    if (e.target.closest('a[href]')) return why('image is a link');
+    if (doc.getSelection()?.toString()) return why('text is selected');
     const r = img.getBoundingClientRect();
-    if (r.width < 40 && r.height < 40) return false; // inline icons, bullets
+    if (r.width < 40 && r.height < 40) return why(`small icon ${Math.round(r.width)}x${Math.round(r.height)}`); // inline icons, bullets
     const src = img.localName === 'image' ? (img.getAttribute('href') || img.getAttribute('xlink:href') || img.getAttributeNS('http://www.w3.org/1999/xlink', 'href')) : img.currentSrc || img.src;
-    if (!src) return false;
+    if (!src) return why('no image source');
+    diag(`${e.type} on image: opening`);
     const fig = img.closest('figure');
     const caption = (fig?.querySelector('figcaption')?.textContent || img.getAttribute('alt') || img.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
     openLightbox(new URL(src, doc.baseURI).href, caption);
@@ -858,6 +909,7 @@ function attachContentHandlers(contents) {
     const dt = Date.now() - t0;
     x0 = null;
     if (doc.getSelection()?.toString()) return;
+    if (e.target.closest?.('img, image') && !(Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 500)) diag(`touch on image not a tap (moved ${Math.round(dx)},${Math.round(dy)} in ${dt} ms)`);
     if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 500 && openImage(e)) { e.preventDefault(); return; } // tap; no follow-up click
     if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 800) dx < 0 ? next() : prev();
   }, { passive: false });
@@ -1380,6 +1432,7 @@ function openSettings() {
   $('#pref-size-val').textContent = S.prefs.fontSize + '%';
   $('#pref-columns').value = S.prefs.columns || 'auto';
   renderConnection();
+  renderDiag();
   renderProviders();
   $('#dlg-settings').showModal();
 }
@@ -1388,6 +1441,10 @@ const ago = (t) => {
   const sec = Math.round((Date.now() - t) / 1000);
   return sec < 60 ? `${sec} s ago` : sec < 3600 ? `${Math.round(sec / 60)} min ago` : new Date(t).toLocaleString();
 };
+function renderDiag() {
+  const pre = $('#diag-log');
+  if (pre) pre.textContent = diagLog.length ? diagLog.slice().reverse().join('\n') : 'Nothing logged yet.';
+}
 function renderConnection() {
   const row = (label, value, cls) => el('div', { class: 'conn-row' }, el('span', { class: 'conn-label' }, label), el('span', { class: 'conn-val ' + (cls || '') }, value));
   const loaded = LOADED_OFFLINE
@@ -1448,20 +1505,30 @@ function saveSettings() {
 
 // ---------------------------------------------------------------- image viewer
 // Full-screen view of a book image. Sizing is CSS: natural size when it fits, scaled down when larger.
-async function openLightbox(src, caption) {
+let lbOpenedAt = 0;
+function openLightbox(src, caption) {
   const img = $('#lb-img');
+  img.onload = () => diag(`image shown ${img.naturalWidth}x${img.naturalHeight}`);
+  img.onerror = () => { diag(`image failed to load: ${src.slice(0, 60)}`); closeLightbox(); toast("Couldn't open that image."); };
   img.src = src;
   $('#lb-caption').textContent = caption;
   $('#lightbox').hidden = false;
-  try { await img.decode(); } catch { closeLightbox(); toast("Couldn't open that image."); }
+  lbOpenedAt = Date.now();
 }
-function closeLightbox() { $('#lightbox').hidden = true; $('#lb-img').removeAttribute('src'); }
+function closeLightbox(e) {
+  if ($('#lightbox').hidden) return;
+  if (e && Date.now() - lbOpenedAt < 350) return; // the tap that opened it must not close it
+  if (e) diag(`viewer closed by ${e.type}`);
+  $('#lightbox').hidden = true;
+  $('#lb-img').removeAttribute('src');
+}
 function wireLightbox() {
   const box = $('#lightbox');
+  // Close on whichever arrives first. iOS may not turn a tap into "click"; pointerup/touchend
+  // always fire. Cancelling touchend stops iOS's delayed click from landing on the page underneath.
+  box.addEventListener('pointerup', closeLightbox);
+  box.addEventListener('touchend', (e) => { e.preventDefault(); closeLightbox(e); }, { passive: false });
   box.addEventListener('click', closeLightbox);
-  // iOS: a tap on a plain element doesn't produce "click"; close on the tap itself, and cancel the
-  // follow-up click so it can't land on the page underneath (re-opening the image or turning a page)
-  box.addEventListener('touchend', (e) => { e.preventDefault(); closeLightbox(); }, { passive: false });
   document.addEventListener('keydown', (e) => {
     if (!$('#lightbox').hidden && e.key === 'Escape') { e.stopPropagation(); closeLightbox(); }
   }, true);

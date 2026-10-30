@@ -63,5 +63,6 @@ WantedBy=multi-user.target
 
 - Ollama: set `OLLAMA_ORIGINS=*` (or your reader URL) so the browser may call it.
 - Backup = copy `data/`.
+- Book scripts: the reading frame allows scripts (Safari/iPad won't run the reader's own tap, swipe and selection handlers otherwise), and any code inside an EPUB (scripts, `on…` handlers, `javascript:` links, embedded frames/plugins) is disarmed before a chapter is shown.
 - Keys: `←/→/Space` turn pages, `L` library, `T` contents, `C` chat, swipe on touch.
 - Images: click/tap to view full screen (actual size, or scaled down to fit if larger); click/tap or `Esc` to close.
