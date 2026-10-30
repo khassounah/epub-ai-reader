@@ -50,7 +50,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 /* main */
 #main { display: flex; min-height: 0; min-width: 0; overflow: hidden; }
 #reader-wrap { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
-#viewer { flex: 1; min-width: 0; height: 100%; overflow: hidden; }
+#viewer { flex: 1; min-width: 0; height: 100%; overflow: hidden; margin: 0 auto; }
 .nav {
   width: 44px; flex: 0 0 44px; border: 0; background: transparent; font-size: 30px;
   color: var(--muted); cursor: pointer;

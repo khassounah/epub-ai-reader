@@ -360,10 +360,11 @@ async function openBook(id) {
   lastLocalNav = Date.now();
   try {
     await rendition.display(p?.cfi || undefined);
-    // Theme CSS (line-height/font size) reflows the section after the first layout, which shifts the
-    // text under a fixed scroll offset. Re-display once styles have settled so we land on the right page.
-    if (p?.cfi) { await new Promise((r) => setTimeout(r, 60)); await rendition.display(p.cfi); }
-  } catch { await rendition.display(); }
+    takeOverResize();
+    // Theme CSS (line-height/font size) reflows the section after the first layout; settle, then put
+    // the saved first line back at the top of the page.
+    if (p?.cfi) { await new Promise((r) => setTimeout(r, 60)); await displayAnchored(p.cfi); }
+  } catch (e) { console.warn('restore position', e); await rendition.display(); }
 
   const nav = await book.loaded.navigation;
   flatToc = [];
@@ -400,6 +401,11 @@ async function openBook(id) {
 }
 
 function registerThemes() {
+  // orphans/widows 1: lines fill columns exactly, so the anchor spacer below lands lines precisely.
+  rendition.themes.default({
+    'html, body': { orphans: '1 !important', widows: '1 !important' },
+    '[data-rd-anchor]::before': { content: '""', display: 'block', height: 'var(--rd-gap, 0px)' },
+  });
   const base = { 'line-height': '1.6' };
   rendition.themes.register('light', { body: { ...base, background: '#fbfaf7 !important', color: '#1d1c1a !important' } });
   rendition.themes.register('sepia', { body: { ...base, background: '#f6ecd6 !important', color: '#3b2f22 !important' } });
@@ -414,16 +420,143 @@ function applyPrefs() {
   const t = S.prefs.theme || 'light';
   document.body.dataset.theme = t;
   document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.body).getPropertyValue('--bg').trim();
-  const key = t + '|' + (S.prefs.fontSize || 100);
+  const key = t + '|' + (S.prefs.fontSize || 100) + '|' + (S.prefs.columns || 'auto');
   if (rendition && rendition._appliedPrefs !== key) {
     const hadPrefs = !!rendition._appliedPrefs;
     rendition._appliedPrefs = key;
     rendition.themes.select(t);
     rendition.themes.fontSize((S.prefs.fontSize || 100) + '%');
-    // a size change reflows the text; go back to the saved reading position
-    const cfi = currentBookId && S.progress[currentBookId]?.cfi;
-    if (hadPrefs && cfi) setTimeout(() => rendition?.display(cfi), 80);
+    if (hadPrefs) requestRelayout(0); // text size / columns reflow: keep the same first line
+    else applyColumns();
   }
+}
+
+// ---------------------------------------------------------------- stable layout
+// epub.js lays a chapter out in fixed columns from its first line, and after any reflow (resize, chat
+// panel, text size) shows the page that *contains* the reading position, so the first line jumps.
+// We own every reflow instead:
+//   1. one serialized relayout at a time (epub.js's own window-resize handler is disabled; racing
+//      re-renders are what left a blank band at the bottom after resizing)
+//   2. after re-rendering, a CSS-only spacer (::before on the anchor's block, no DOM nodes added, so
+//      CFIs and saved positions are unaffected) pushes the saved first line to the top of a page.
+function takeOverResize() {
+  const st = rendition?.manager?.stage;
+  if (!st || st._rdOwned) return;
+  st._rdOwned = true;
+  if (st.resizeFunc) window.removeEventListener('resize', st.resizeFunc);
+  if (st.orientationChangeFunc) window.removeEventListener('orientationchange', st.orientationChangeFunc);
+}
+
+let relayoutT = null, relayoutChain = Promise.resolve();
+function requestRelayout(delay = 150) {
+  clearTimeout(relayoutT);
+  relayoutT = setTimeout(() => { relayoutChain = relayoutChain.then(relayout, relayout); }, delay);
+}
+async function relayout() {
+  if (!rendition?.manager || !currentBookId) return;
+  const r = rendition;
+  const anchor = S.progress[currentBookId]?.cfi || currentLoc?.start.cfi;
+  applyColumns();
+  r.manager._stageSize = undefined; // always re-measure; a stale cached size skipped real resizes
+  r.manager.resize(undefined, undefined, anchor); // re-renders views at the container's real size
+  if (anchor && r === rendition) await displayAnchored(anchor).catch((e) => console.warn('relayout', e));
+}
+
+const frames = (n = 2) => new Promise((res) => { const f = () => (--n <= 0 ? res() : requestAnimationFrame(f)); requestAnimationFrame(f); });
+
+async function displayAnchored(cfi) {
+  const r = rendition;
+  await r.display(cfi);
+  if (r !== rendition) return;
+  await frames();
+  if (placeAnchor(cfi)) {
+    await frames();
+    const view = r.manager.views.all().find((v) => v.contents && v.section?.index === sectionIndexOf(cfi));
+    view?.expand();
+    await r.display(cfi);
+  }
+}
+
+function sectionIndexOf(cfi) {
+  try { return book.spine.get(cfi)?.index; } catch { return undefined; }
+}
+
+// Make the line at `cfi` the first line of a page. Returns true if the layout changed.
+function placeAnchor(cfi) {
+  const idx = sectionIndexOf(cfi);
+  const contents = rendition.getContents().find((c) => c.sectionIndex === idx);
+  if (!contents) return false;
+  const doc = contents.document, body = doc.body;
+  let changed = false;
+  for (const e of doc.querySelectorAll('[data-rd-anchor]')) { e.removeAttribute('data-rd-anchor'); e.style.removeProperty('--rd-gap'); changed = true; }
+
+  let range;
+  try { range = contents.range(cfi); } catch { return changed; }
+  const lay = rendition.manager.layout;
+  const delta = lay.delta, two = lay.divisor === 2;
+  const bcs = doc.defaultView.getComputedStyle(body);
+  const brect = body.getBoundingClientRect();
+  const colTop = brect.top + parseFloat(bcs.paddingTop);
+  const colH = body.clientHeight - parseFloat(bcs.paddingTop) - parseFloat(bcs.paddingBottom);
+  if (!delta || !(colH > 50)) return changed;
+
+  const node = range.startContainer.nodeType === 3 ? range.startContainer : (range.startContainer.childNodes[range.startOffset] || range.startContainer);
+  const textEl = node.nodeType === 3 ? node.parentElement : node;
+  const lineH = parseFloat(doc.defaultView.getComputedStyle(textEl).lineHeight) || parseFloat(doc.defaultView.getComputedStyle(textEl).fontSize) * 1.5 || 20;
+  const measure = () => {
+    const rr = doc.createRange();
+    if (node.nodeType === 3) {
+      const o = node === range.startContainer ? range.startOffset : 0;
+      rr.setStart(node, Math.min(o, node.length));
+      rr.setEnd(node, Math.min(o + 1, node.length));
+      const rc = rr.getClientRects()[0] || rr.getBoundingClientRect();
+      return rc;
+    }
+    return node.getBoundingClientRect();
+  };
+
+  // nearest block-level ancestor gets the spacer
+  let block = textEl;
+  while (block && block !== body && !/^(block|list-item|flow-root|table)$/.test(doc.defaultView.getComputedStyle(block).display)) block = block.parentElement;
+  if (!block || block === body || block === doc.documentElement) return changed;
+
+  let gap = 0;
+  for (let i = 0; i < 6; i++) {
+    const rc = measure();
+    if (!rc || (!rc.width && !rc.height)) break;
+    const yOff = rc.top - colTop;
+    const atTop = yOff < lineH * 0.6;
+    const secondCol = two && ((rc.left % delta) + delta) % delta >= delta / 2;
+    if (atTop && !secondCol) return changed || gap > 0;
+    gap += atTop ? colH : Math.max(1, colH - yOff - 0.5);
+    block.setAttribute('data-rd-anchor', '');
+    block.style.setProperty('--rd-gap', gap.toFixed(1) + 'px');
+    changed = true;
+  }
+  return changed;
+}
+
+
+// Column layout. We decide one vs two columns ourselves from the space available:
+// - two columns only when each column keeps >= ~480px of text (scaled by text size);
+//   epub.js's default switches at 800px total, which gives cramped ~340px columns
+// - a single column is capped at a readable line length and centred, instead of
+//   stretching across a wide window.
+const COL_MIN_PX = 480, SINGLE_MAX_PX = 760;
+function applyColumns() {
+  if (!rendition) return;
+  const scale = (S.prefs.fontSize || 100) / 100;
+  const avail = $('#viewer').parentElement.clientWidth - $('#prev').offsetWidth - $('#next').offsetWidth;
+  const mode = S.prefs.columns || 'auto';
+  // epub.js leaves a gap of ~16% of the width between the two columns: column = 0.418 × width
+  const two = mode === 'two' ? avail >= 600 : mode === 'auto' ? avail * 0.418 >= COL_MIN_PX * scale : false;
+  const maxW = two ? '' : Math.round(SINGLE_MAX_PX * scale) + 'px';
+  const k = two + '|' + maxW;
+  if (rendition._colKey === k) return false;
+  rendition._colKey = k;
+  $('#viewer').style.maxWidth = maxW;
+  rendition.spread(two ? 'auto' : 'none', two ? 1 : undefined);
+  return true;
 }
 
 function attachContentHandlers(contents) {
@@ -910,6 +1043,7 @@ function openSettings() {
   $('#pref-theme').value = S.prefs.theme;
   $('#pref-size').value = S.prefs.fontSize;
   $('#pref-size-val').textContent = S.prefs.fontSize + '%';
+  $('#pref-columns').value = S.prefs.columns || 'auto';
   const swOk = 'serviceWorker' in navigator;
   $('#device-info').textContent = `Device ${S.deviceId}. ${swOk ? 'Offline app cache is active.' : 'Offline app cache unavailable: this page must be served over HTTPS (e.g. tailscale serve) or from localhost. Your books and progress still stay on this device, but the app itself can’t load without the server.'}`;
   renderProviders();
@@ -941,9 +1075,9 @@ function saveSettings() {
   delete S._pendingDefault;
   S.settings = { providers: editProviders, defaultProviderId: def, updatedAt: Date.now() };
   markDirty('settings');
-  const theme = $('#pref-theme').value, size = +$('#pref-size').value;
-  if (theme !== S.prefs.theme || size !== S.prefs.fontSize) {
-    S.prefs = { theme, fontSize: size, updatedAt: Date.now() };
+  const theme = $('#pref-theme').value, size = +$('#pref-size').value, columns = $('#pref-columns').value;
+  if (theme !== S.prefs.theme || size !== S.prefs.fontSize || columns !== (S.prefs.columns || 'auto')) {
+    S.prefs = { theme, fontSize: size, columns, updatedAt: Date.now() };
     markDirty('prefs');
     applyPrefs();
   }
@@ -1037,15 +1171,13 @@ function wireUI() {
   });
 
   // keep the reader sized correctly when the chat panel or window changes
-  new ResizeObserver(() => {
-    if (!rendition) return;
-    clearTimeout(wireUI.rt);
-    wireUI.rt = setTimeout(async () => {
-      const cfi = S.progress[currentBookId]?.cfi;
-      rendition.resize();
-      if (cfi) { await new Promise((r) => setTimeout(r, 60)); rendition.display(cfi); }
-    }, 150);
-  }).observe($('#viewer'));
+  let lastWrap = '';
+  new ResizeObserver(([e]) => {
+    const k = Math.round(e.contentRect.width) + 'x' + Math.round(e.contentRect.height);
+    if (k === lastWrap) return;
+    lastWrap = k;
+    if (rendition) requestRelayout();
+  }).observe($('#reader-wrap'));
 
   window.addEventListener('online', () => sync());
   document.addEventListener('visibilitychange', () => {
