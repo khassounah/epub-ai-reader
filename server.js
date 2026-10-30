@@ -3,6 +3,7 @@
 // The client is offline-first: it keeps its own copy of everything and syncs here when reachable.
 
 import express from 'express';
+import crypto from 'crypto';
 import fs from 'fs/promises';
 import fss from 'fs';
 import path from 'path';
@@ -86,6 +87,7 @@ const stateOut = () => ({
   settings: db.settings,
   prefs: db.prefs,
   serverTime: Date.now(),
+  build: build(),
 });
 
 const safeId = (id) => /^[A-Za-z0-9_-]{1,64}$/.test(id);
@@ -94,7 +96,32 @@ const safeId = (id) => /^[A-Za-z0-9_-]{1,64}$/.test(id);
 const app = express();
 app.disable('x-powered-by');
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, build: build() }));
+
+// ---------- app code versioning ----------
+// "build" = hash of the client files' sizes and modification times, recomputed on demand, so dropping
+// new files into public/ is picked up without restarting. index.html is served uncached with
+// ?v=<build> on its scripts/styles, so no browser or proxy cache can hand out an old mix of files.
+const PUBLIC = path.join(__dirname, 'public');
+const BUILD_FILES = ['index.html', 'app.js', 'styles.css', 'sw.js'];
+let buildCache = { at: 0, value: '' };
+function build() {
+  if (Date.now() - buildCache.at < 2000) return buildCache.value;
+  const h = crypto.createHash('sha1');
+  for (const f of BUILD_FILES) {
+    try { const st = fss.statSync(path.join(PUBLIC, f)); h.update(`${f}:${st.size}:${st.mtimeMs};`); } catch {}
+  }
+  buildCache = { at: Date.now(), value: h.digest('hex').slice(0, 10) };
+  return buildCache.value;
+}
+async function sendIndex(_req, res) {
+  const v = build();
+  const html = (await fs.readFile(path.join(PUBLIC, 'index.html'), 'utf8'))
+    .replace(/(href|src)="\/(app\.js|styles\.css)"/g, `$1="/$2?v=${v}"`)
+    .replace('<head>', `<head>\n  <meta name="reader-build" content="${v}">`);
+  res.set('Cache-Control', 'no-store').type('html').send(html);
+}
+app.get(['/', '/index.html'], sendIndex);
 
 app.get('/api/state', (_req, res) => res.json(stateOut()));
 
@@ -178,10 +205,10 @@ app.delete('/api/books/:id', async (req, res) => {
 app.get('/lib/epub.min.js', (_req, res) => res.sendFile(path.join(__dirname, 'node_modules/epubjs/dist/epub.min.js')));
 app.get('/lib/jszip.min.js', (_req, res) => res.sendFile(path.join(__dirname, 'node_modules/jszip/dist/jszip.min.js')));
 
-app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res, p) => {
-    if (p.endsWith('sw.js')) res.setHeader('Cache-Control', 'no-cache');
-  },
+app.use(express.static(PUBLIC, {
+  index: false,
+  // always revalidate (cheap 304 when unchanged); never let a browser reuse old code silently
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
 }));
 
 app.listen(PORT, HOST, () => {

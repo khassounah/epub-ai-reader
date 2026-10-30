@@ -4,7 +4,7 @@
 // Network-first: when the server is reachable you always get the latest code (a cheap 304 when
 // nothing changed); the cached copy is used only when the server can't be reached within a few
 // seconds, e.g. offline or on a plane.
-const CACHE = 'reader-shell-v10';
+const CACHE = 'reader-shell-v11';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/manifest.json', '/icon.svg', '/lib/epub.min.js', '/lib/jszip.min.js'];
 const NETWORK_TIMEOUT_MS = 4000;
 

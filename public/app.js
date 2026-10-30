@@ -1,7 +1,8 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '10';
+const APP_VERSION = '11';
+const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 console.info('Reader version', APP_VERSION);
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -193,7 +194,16 @@ async function sync() {
   }
 }
 
-let lastRemoteNotice = 0;
+let lastRemoteNotice = 0, updateOffered = false, swError = '';
+// Clear the saved app copy (service worker + its cache) and reload from the server.
+// Books, positions, chats and keys (IndexedDB) are untouched.
+async function hardReload() {
+  try {
+    for (const r of (await navigator.serviceWorker?.getRegistrations?.()) || []) await r.unregister();
+    for (const k of (await caches?.keys?.()) || []) await caches.delete(k);
+  } catch (e) { console.warn('hard reload', e); }
+  location.reload();
+}
 // Another device read this book more recently than this one: offer to jump there (never move on our own).
 function offerOtherDevice() {
   const p = S.progress[currentBookId], mine = S.here[currentBookId];
@@ -206,6 +216,10 @@ function offerOtherDevice() {
   toast(`${p.deviceName || 'Another device'} is at ${where} (${theirs > ours ? 'ahead' : 'behind'})`, 'Jump', () => jumpTo(p.cfi), 15000);
 }
 function applyRemote(R) {
+  if (R.build && BUILD && R.build !== BUILD && !updateOffered) {
+    updateOffered = true;
+    toast('A new version of the reader is available.', 'Update', hardReload, 0);
+  }
   // books
   const remoteIds = new Set(R.books.map((b) => b.id));
   for (const b of R.books) S.books[b.id] = { ...S.books[b.id], ...b };
@@ -1332,7 +1346,16 @@ function openSettings() {
   $('#pref-size-val').textContent = S.prefs.fontSize + '%';
   $('#pref-columns').value = S.prefs.columns || 'auto';
   const swOk = 'serviceWorker' in navigator;
-  $('#device-info').textContent = `Reader version ${APP_VERSION} · ${deviceName()} · device ${S.deviceId}. ${swOk ? 'Offline app cache is active.' : 'Offline app cache unavailable: this page must be served over HTTPS (e.g. tailscale serve) or from localhost. Your books and progress still stay on this device, but the app itself can’t load without the server.'}`;
+  const offline = navigator.serviceWorker?.controller ? 'Offline: ready. The reader opens without the server.'
+    : !swOk ? (/iPad|iPhone/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent))
+      ? 'Offline: not supported in this browser. On iPad/iPhone use Safari (ideally Share → Add to Home Screen) to open the reader without the server.'
+      : 'Offline: unavailable. The page must be served over HTTPS (e.g. tailscale serve) or from localhost.')
+    : swError ? `Offline: this browser refused it (${swError}). On iPad/iPhone use Safari for offline reading.`
+    : 'Offline: not active yet. Reload once while connected.';
+  $('#device-info').replaceChildren(
+    el('div', {}, `Reader version ${APP_VERSION}${BUILD ? ` (build ${BUILD})` : ''} · ${deviceName()} · device ${S.deviceId}`),
+    el('div', {}, offline + ' Books, positions and chats are stored on this device either way.'),
+    el('button', { type: 'button', class: 'btn small', style: 'margin-top:6px', onclick: hardReload, title: 'Clears the saved copy of the app and loads it fresh from the server. Your books and data stay.' }, 'Reload app from server'));
   renderProviders();
   $('#dlg-settings').showModal();
 }
@@ -1479,7 +1502,7 @@ function wireUI() {
 // ---------------------------------------------------------------- boot
 async function boot() {
   wireUI();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('sw', e));
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch((e) => { swError = e?.message || String(e); console.warn('sw', e); });
   await loadLocal();
   outboxKeys = new Set(await idb.keys('outbox'));
   applyPrefs();
