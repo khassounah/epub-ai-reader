@@ -1,7 +1,7 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '16';
+const APP_VERSION = '17';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 // set by the service worker when this page came from the saved copy instead of the server
 const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
@@ -260,7 +260,21 @@ function applyRemote(R) {
   // progress
   for (const [id, p] of Object.entries(R.progress || {})) S.progress[id] = mergeProgress(S.progress[id], p);
   // conversations
-  for (const c of R.conversations || []) S.conversations[c.id] = mergeConv(S.conversations[c.id], c);
+  for (const c of R.conversations || []) {
+    const local = S.conversations[c.id];
+    if (!local) { S.conversations[c.id] = c; continue; }
+    // Merge *into* the existing objects: a reply being generated holds references to this conversation
+    // and its message; replacing them would leave the reply writing into an orphaned copy.
+    const merged = mergeConv(local, c);
+    const mine = new Map(local.messages.map((m) => [m.id, m]));
+    merged.messages = merged.messages.map((m) => {
+      const lm = mine.get(m.id);
+      if (!lm || lm === m) return m;
+      if (m.id !== generatingMsgId) Object.assign(lm, m);
+      return lm;
+    });
+    Object.assign(local, merged);
+  }
   // singletons
   S.lastBook = newer(S.lastBook, R.lastBook);
   const oldSettings = S.settings.updatedAt;
@@ -1129,17 +1143,34 @@ function refreshAnnotations() {
 
 // ---------------------------------------------------------------- AI providers
 const PRESETS = {
-  anthropic: { name: 'Claude', type: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-5-5' },
+  anthropic: { name: 'Claude', type: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-5-5', fallbackModel: 'claude-haiku-5-5' },
   openai: { name: 'OpenAI', type: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5' },
   openrouter: { name: 'OpenRouter', type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', model: 'anthropic/claude-sonnet-5.5' },
-  gemini: { name: 'Gemini', type: 'openai', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-pro' },
+  gemini: { name: 'Gemini', type: 'openai', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash', fallbackModel: 'gemini-3.5-flash-lite' },
   ollama: { name: 'Ollama', type: 'openai', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' },
   custom: { name: 'Custom', type: 'openai', baseUrl: 'https://', model: '' },
 };
 const getProvider = (id) => S.settings.providers.find((p) => p.id === id) ||
   S.settings.providers.find((p) => p.id === S.settings.defaultProviderId) || S.settings.providers[0];
 
-class ProviderError extends Error {}
+class ProviderError extends Error {
+  constructor(message, status = 0, retryAfterMs = 0) { super(message); this.status = status; this.retryAfterMs = retryAfterMs; }
+}
+// Statuses that mean "busy / try again shortly" rather than "your request is wrong".
+const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+// Turn an HTTP error into a short readable message (providers return JSON in various shapes).
+async function providerFail(r) {
+  const text = await r.text().catch(() => '');
+  let msg = text;
+  try {
+    let j = JSON.parse(text);
+    if (Array.isArray(j)) j = j[0];
+    msg = j?.error?.message || j?.message || (typeof j?.error === 'string' ? j.error : '') || text;
+  } catch {}
+  const ra = r.headers.get('retry-after');
+  const retryAfterMs = ra ? (Number(ra) * 1000 || Math.max(0, Date.parse(ra) - Date.now()) || 0) : 0;
+  throw new ProviderError(`HTTP ${r.status}: ${String(msg).trim().slice(0, 400)}`, r.status, retryAfterMs);
+}
 
 async function readSSE(resp, onData) {
   const reader = resp.body.getReader();
@@ -1163,7 +1194,7 @@ async function readSSE(resp, onData) {
   }
 }
 
-async function streamChat(provider, system, messages, onText, signal) {
+async function streamChat(provider, model, system, messages, onText, signal) {
   const base = (provider.baseUrl || '').replace(/\/+$/, '');
   if (provider.type === 'anthropic') {
     const r = await fetch(base + '/v1/messages', {
@@ -1172,23 +1203,23 @@ async function streamChat(provider, system, messages, onText, signal) {
         'content-type': 'application/json', 'x-api-key': provider.apiKey || '',
         'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true',
       },
-      body: JSON.stringify({ model: provider.model, max_tokens: 4096, system, messages, stream: true }),
+      body: JSON.stringify({ model, max_tokens: 4096, system, messages, stream: true }),
     });
-    if (!r.ok) throw new ProviderError(`${r.status}: ${await r.text()}`);
+    if (!r.ok) await providerFail(r);
     await readSSE(r, (j) => {
       if (j.type === 'content_block_delta' && j.delta?.type === 'text_delta') onText(j.delta.text);
-      else if (j.type === 'error') throw new ProviderError(j.error?.message || 'stream error');
+      else if (j.type === 'error') throw new ProviderError(j.error?.message || 'stream error', j.error?.type === 'overloaded_error' ? 529 : 0);
     });
   } else {
     const headers = { 'content-type': 'application/json' };
     if (provider.apiKey) headers.authorization = 'Bearer ' + provider.apiKey;
     const r = await fetch(base + '/chat/completions', {
       method: 'POST', signal, headers,
-      body: JSON.stringify({ model: provider.model, stream: true, messages: [{ role: 'system', content: system }, ...messages] }),
+      body: JSON.stringify({ model, stream: true, messages: [{ role: 'system', content: system }, ...messages] }),
     });
-    if (!r.ok) throw new ProviderError(`${r.status}: ${await r.text()}`);
+    if (!r.ok) await providerFail(r);
     await readSSE(r, (j) => {
-      if (j.error) throw new ProviderError(j.error.message || JSON.stringify(j.error));
+      if (j.error) throw new ProviderError(j.error.message || JSON.stringify(j.error), Number(j.error.code) || 0);
       const t = j.choices?.[0]?.delta?.content;
       if (t) onText(t);
     });
@@ -1196,7 +1227,7 @@ async function streamChat(provider, system, messages, onText, signal) {
 }
 
 // ---------------------------------------------------------------- chat
-let activeConvId = null, draft = null, streaming = null;
+let activeConvId = null, draft = null, streaming = null, generatingMsgId = null;
 
 function buildContext(type, sel) {
   const ctx = {
@@ -1236,8 +1267,9 @@ function systemPrompt(conv) {
 
 function apiMessages(conv) {
   const out = [];
+  const hidden = new Set(conv.hidden || []);
   for (const m of conv.messages) {
-    if (m.error || !m.content) continue;
+    if (m.error || !m.content || hidden.has(m.id)) continue;
     const last = out[out.length - 1];
     if (last && last.role === m.role) last.content += '\n\n' + m.content;
     else out.push({ role: m.role, content: m.content });
@@ -1263,24 +1295,72 @@ async function send(text) {
   await generate(conv);
 }
 
+// Busy/overloaded answers (503 "high demand", 429, 529…) are retried with short waits; if the model is
+// still busy and the provider has a fallback model, that is tried next. Retries only happen before any
+// text has arrived, so a reply is never duplicated.
+const RETRY_WAITS_MS = [2000, 5000, 10000];
+const sleep = (ms, signal) => new Promise((res, rej) => {
+  const t = setTimeout(res, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('aborted', 'AbortError')); }, { once: true });
+});
+
 async function generate(conv) {
   const provider = getProvider(conv.providerId);
   if (!provider) { renderThread(); toast('Add an AI provider in Settings first', 'Open', openSettings); return; }
   const asst = { id: uid(), role: 'assistant', content: '', ts: Date.now() + 1, model: provider.model, provider: provider.name };
   conv.messages.push(asst);
+  generatingMsgId = asst.id;
   renderThread();
   streaming = new AbortController();
+  const signal = streaming.signal;
   $('#chat-send').textContent = 'Stop';
   let pending = false;
+  const models = [provider.model, provider.fallbackModel].filter((m, i, a) => m && a.indexOf(m) === i);
+  let lastErr = null;
   try {
-    await streamChat(provider, systemPrompt(conv), apiMessages(conv), (t) => {
-      asst.content += t;
-      if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; updateBubble(asst, true); }); }
-    }, streaming.signal);
+    outer: for (const model of models) {
+      asst.model = model;
+      asst.fallback = model !== provider.model || undefined;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await streamChat(provider, model, systemPrompt(conv), apiMessages(conv), (t) => {
+            asst.status = '';
+            asst.content += t;
+            if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; updateBubble(asst, true); }); }
+          }, signal);
+          lastErr = null;
+          break outer;
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          lastErr = e;
+          const busy = e instanceof ProviderError && RETRYABLE.has(e.status);
+          if (!busy || asst.content) break outer; // real error, or text already shown: don't retry
+          if (attempt >= RETRY_WAITS_MS.length) break; // give up on this model; try the fallback, if any
+          const wait = Math.min(20000, e.retryAfterMs || RETRY_WAITS_MS[attempt]);
+          asst.status = `${model} is busy (HTTP ${e.status}); retrying in ${Math.round(wait / 1000)} s (${attempt + 1}/${RETRY_WAITS_MS.length})…`;
+          renderThread();
+          await sleep(wait, signal);
+          asst.status = '';
+          renderThread();
+        }
+      }
+      if (models.length > 1 && model === provider.model) {
+        asst.status = `${model} is still busy; trying fallback ${models[1]}…`;
+        renderThread();
+      }
+    }
+    if (lastErr) throw lastErr;
   } catch (e) {
-    if (e.name !== 'AbortError') asst.error = e instanceof TypeError ? `Network error reaching ${provider.name} (${e.message}). Check your connection, the base URL, or CORS for local servers.` : e.message;
+    if (e.name !== 'AbortError') {
+      const busy = e instanceof ProviderError && RETRYABLE.has(e.status);
+      asst.error = e instanceof TypeError ? `Network error reaching ${provider.name} (${e.message}). Check your connection, the base URL, or CORS for local servers.`
+        : busy ? `${provider.name} is busy (${e.message}). Tried ${RETRY_WAITS_MS.length + 1}× per model${models.length > 1 ? ', including the fallback' : ''}. Try again shortly${models.length > 1 ? '' : ', or set a fallback model for this provider in Settings'}.`
+        : e.message;
+    }
   } finally {
+    asst.status = '';
     streaming = null;
+    generatingMsgId = null;
     $('#chat-send').textContent = 'Send';
     conv.updatedAt = Date.now();
     markDirty('conversations', conv.id);
@@ -1385,12 +1465,14 @@ function renderThread() {
   if (ctx.type === 'page' && ctx.pageText) box.append(el('div', { class: 'truncate', title: ctx.pageText.slice(0, 600) }, 'Page text included: “' + ctx.pageText.slice(0, 120) + '…”'));
 
   const msgs = $('#chat-messages');
-  msgs.replaceChildren(...conv.messages.map((m) => bubble(m, conv)));
+  const hidden = new Set(conv.hidden || []);
+  msgs.replaceChildren(...conv.messages.filter((m) => !hidden.has(m.id)).map((m) => bubble(m, conv)));
   msgs.scrollTop = msgs.scrollHeight;
 }
 
 function bubble(m, conv) {
-  const isLast = conv.messages[conv.messages.length - 1] === m;
+  const visible = conv.messages.filter((x) => !(conv.hidden || []).includes(x.id));
+  const isLast = visible[visible.length - 1] === m;
   const div = el('div', { class: `msg ${m.role}${m.error ? ' error' : ''}`, 'data-id': m.id });
   if (m.role === 'user') {
     div.append(el('div', {}, m.content));
@@ -1398,9 +1480,14 @@ function bubble(m, conv) {
   } else {
     const body = el('div', { class: 'body' + (streaming && isLast && !m.error ? ' typing' : ''), html: md(m.content || '') });
     div.append(body);
+    if (m.status) div.append(el('div', { class: 'meta' }, m.status));
     if (m.error) div.append(el('div', {}, 'Error: ' + m.error));
-    div.append(el('div', { class: 'meta' }, [m.provider, m.model].filter(Boolean).join(' · '),
-      (m.error || (isLast && !streaming)) ? el('span', {}, ' · ', el('a', { onclick: () => retry(conv) }, 'retry')) : null));
+    div.append(el('div', { class: 'meta' }, [m.provider, m.model + (m.fallback ? ' (fallback)' : '')].filter(Boolean).join(' · '),
+      (m.error && isLast) || (isLast && !streaming) ? el('span', {}, ' · ', el('a', { onclick: () => retry(conv) }, 'retry')) : null,
+      m.error && !(streaming && isLast) ? el('span', {}, ' · ', el('a', {
+        // hidden on the conversation (newest version wins in sync) so the server can't merge it back
+        onclick: () => { conv.hidden = [...new Set([...(conv.hidden || []), m.id])]; conv.updatedAt = Date.now(); markDirty('conversations', conv.id); renderThread(); },
+      }, 'remove')) : null));
   }
   return div;
 }
@@ -1481,6 +1568,7 @@ function renderProviders() {
       field('Base URL', 'baseUrl', 'url', 'full'),
       field('Model', 'model'),
       field('API key', 'apiKey', 'password'),
+      field('Fallback model (optional, used when the main one is busy)', 'fallbackModel', 'text', 'full'),
       el('div', { class: 'actions' },
         el('label', {}, el('input', { type: 'radio', name: 'default-provider', checked: p.id === defId, onchange: () => { S._pendingDefault = p.id; } }), 'Default'),
         el('button', { type: 'button', class: 'ghost small', onclick: () => { editProviders = editProviders.filter((x) => x !== p); renderProviders(); } }, 'Remove')));
