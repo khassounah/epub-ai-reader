@@ -215,13 +215,93 @@ async function downloadMissing() {
     }
   } finally { downloading = false; }
 }
-async function downloadBook(id) {
-  const r = await fetch(`/api/books/${id}/file`);
-  if (!r.ok) throw new Error('download ' + r.status);
-  const blob = await r.blob();
-  await idb.set('files', id, blob);
-  makeCover(id, await blob.arrayBuffer());
-  renderLibrary();
+// One download per book at a time (background sync and opening the book share it), streamed so we can
+// show progress, abort if the server stops sending, and report the real cause when it fails.
+const downloads = new Map(); // id -> { promise, loaded, total, attempt }
+const partial = new Map(); // id -> bytes kept from a failed download, so Retry resumes
+const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
+const STALL_MS = 30000;
+function downloadBook(id) {
+  const existing = downloads.get(id);
+  if (existing) return existing.promise;
+  const d = { loaded: 0, total: S.books[id]?.size || 0, attempt: 0 };
+  const chunks = [];
+  const MAX_ATTEMPTS = 6;
+
+  // One HTTP attempt. Resumes from d.loaded with a Range request, so a dropped connection on a
+  // large book continues where it stopped instead of starting over.
+  async function attempt() {
+    const ctrl = new AbortController();
+    let stallT, stalled = false;
+    const arm = () => { clearTimeout(stallT); stallT = setTimeout(() => { stalled = true; ctrl.abort(); }, STALL_MS); };
+    arm();
+    try {
+      let r;
+      const headers = d.loaded ? { range: `bytes=${d.loaded}-` } : {};
+      try { r = await fetch(`/api/books/${id}/file`, { signal: ctrl.signal, cache: 'no-store', headers }); }
+      catch (e) { throw Object.assign(new Error(stalled ? 'stalled' : `can't reach the server (${e.message})`), { retry: true }); }
+      if (r.status === 404) {
+        throw new Error("The server doesn't have this book's file (HTTP 404). Open the reader on the device you added it from so it can upload, or add the EPUB again.");
+      }
+      if (!r.ok) throw Object.assign(new Error(`server returned HTTP ${r.status}`), { retry: r.status >= 500 });
+      if (d.loaded && r.status !== 206) { chunks.length = 0; d.loaded = 0; } // server ignored the range: start over
+      if (!d.loaded) d.total = Number(r.headers.get('content-length')) || d.total;
+      const reader = r.body.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          d.loaded += value.length;
+          d.receiving = true;
+          arm();
+        }
+      } catch (e) {
+        throw Object.assign(new Error(stalled ? 'stalled' : `connection dropped (${e.message})`), { retry: true });
+      }
+      if (d.total && d.loaded < d.total) throw Object.assign(new Error('connection closed early'), { retry: true });
+    } finally {
+      clearTimeout(stallT);
+    }
+  }
+
+  // resume a previous failed attempt from this session
+  const prev = partial.get(id);
+  if (prev) { chunks.push(...prev.chunks); d.loaded = prev.loaded; d.total = prev.total; partial.delete(id); }
+  d.promise = (async () => {
+    try {
+      for (;;) {
+        d.attempt++;
+        try { await attempt(); break; }
+        catch (e) {
+          d.receiving = false;
+          if (!e.retry) throw e;
+          if (d.attempt >= MAX_ATTEMPTS) {
+            const why = e.message === 'stalled' ? `no data from the server for ${STALL_MS / 1000} s` : e.message;
+            throw new Error(`Download failed after ${MAX_ATTEMPTS} tries (${why}). Got ${mb(d.loaded)}${d.total ? ' of ' + mb(d.total) : ''}; Retry continues from there.`);
+          }
+          await new Promise((res) => setTimeout(res, Math.min(10000, 1500 * d.attempt)));
+        }
+      }
+      const blob = new Blob(chunks, { type: 'application/epub+zip' });
+      chunks.length = 0;
+      if (d.total && blob.size !== d.total) throw new Error(`Download incomplete: got ${mb(blob.size)} of ${mb(d.total)}.`);
+      try { await idb.set('files', id, blob); }
+      catch (e) { throw new Error(`Downloaded, but couldn't save it on this device (${e.name || e.message}). Browser storage may be full or blocked, e.g. in a private window.`); }
+      partial.delete(id);
+      // Cover from a big book means parsing it a second time; for those, the cover is made when it's opened.
+      if (blob.size < 30 * 1048576) blob.arrayBuffer().then((buf) => makeCover(id, buf)).then(renderLibrary);
+      renderLibrary();
+    } catch (e) {
+      // keep what we have so Retry resumes instead of starting from zero
+      if (d.loaded) partial.set(id, { chunks: chunks.slice(), loaded: d.loaded, total: d.total });
+      throw e;
+    } finally {
+      downloads.delete(id);
+    }
+  })();
+  downloads.set(id, d);
+  return d.promise;
 }
 
 // ---------------------------------------------------------------- library
@@ -335,9 +415,17 @@ async function openBook(id) {
   let blob = await idb.get('files', id);
   if (!blob) {
     if (!S.books[id]) return;
-    toast('Downloading book…');
-    try { await downloadBook(id); blob = await idb.get('files', id); }
-    catch { toast('This book is not downloaded on this device yet, and the server is unreachable.'); return; }
+    const title = S.books[id].title;
+    const p = downloadBook(id);
+    const tick = () => {
+      const d = downloads.get(id);
+      if (d) toast(`Downloading “${title}”… ${mb(d.loaded)}${d.total ? ' / ' + mb(d.total) : ''}${d.attempt > 1 && !d.receiving ? ` (reconnecting, try ${d.attempt})` : ''}`, null, null, 0);
+    };
+    tick();
+    const iv = setInterval(tick, 400);
+    try { await p; blob = await idb.get('files', id); $('#toast').hidden = true; }
+    catch (e) { toast(e.message, 'Retry', () => openBook(id), 0); return; }
+    finally { clearInterval(iv); }
   }
   closeBook();
   currentBookId = id;
@@ -347,6 +435,7 @@ async function openBook(id) {
   document.title = meta.title;
 
   book = ePub(await blob.arrayBuffer());
+  const thisOpen = book._rdKey = id + ':' + Date.now();
   rendition = book.renderTo('viewer', { width: '100%', height: '100%', flow: 'paginated', spread: 'auto', allowScriptedContent: false });
   registerThemes();
   applyPrefs();
@@ -365,6 +454,20 @@ async function openBook(id) {
     // the saved first line back at the top of the page.
     if (p?.cfi) { await new Promise((r) => setTimeout(r, 60)); await displayAnchored(p.cfi); }
   } catch (e) { console.warn('restore position', e); await rendition.display(); }
+
+  idb.get('kv', 'cover:' + id).then(async (have) => {
+    if (have || book?._rdKey !== thisOpen) return;
+    try {
+      const url = await book.coverUrl();
+      if (!url) return;
+      const img = new Image(); img.src = url; await img.decode();
+      const c = document.createElement('canvas'), h = 200;
+      c.height = h; c.width = Math.round((img.width / img.height) * h) || 140;
+      c.getContext('2d').drawImage(img, 0, 0, c.width, h);
+      await idb.set('kv', 'cover:' + id, c.toDataURL('image/jpeg', 0.8));
+      renderLibrary();
+    } catch (e) { console.warn('cover', e); }
+  });
 
   const nav = await book.loaded.navigation;
   flatToc = [];
@@ -1088,13 +1191,15 @@ function saveSettings() {
 
 // ---------------------------------------------------------------- UI chrome
 let toastT;
-function toast(msg, action, fn) {
+// ms: auto-hide delay; 0 = stays until replaced or dismissed
+function toast(msg, action, fn, ms) {
   const t = $('#toast');
   t.replaceChildren(el('span', {}, msg));
   if (action) t.append(el('button', { onclick: () => { t.hidden = true; fn(); } }, action));
+  if (ms === 0) t.append(el('button', { title: 'Dismiss', onclick: () => { t.hidden = true; } }, '✕'));
   t.hidden = false;
   clearTimeout(toastT);
-  toastT = setTimeout(() => (t.hidden = true), action ? 9000 : 3500);
+  if (ms !== 0) toastT = setTimeout(() => (t.hidden = true), ms || (action ? 9000 : 3500));
 }
 function openDrawer(id) { closeDrawers(); $('#' + id).hidden = false; $('#scrim').hidden = false; }
 function closeDrawers() { $$('.drawer').forEach((d) => (d.hidden = true)); $('#scrim').hidden = true; }

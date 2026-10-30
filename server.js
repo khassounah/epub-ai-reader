@@ -130,6 +130,7 @@ app.put('/api/books/:id', express.raw({ type: '*/*', limit: '500mb' }), async (r
   } catch {}
   if (!req.body?.length) return res.status(400).json({ error: 'empty body' });
   await fs.writeFile(path.join(BOOKS_DIR, id + '.epub'), req.body);
+  console.log(`[books] PUT ${id}: stored ${(req.body.length / 1048576).toFixed(1)} MB`);
   db.books[id] = {
     id,
     title: String(meta.title || 'Untitled').slice(0, 500),
@@ -147,8 +148,15 @@ app.get('/api/books/:id/file', (req, res) => {
   const { id } = req.params;
   if (!safeId(id)) return res.status(400).end();
   const file = path.join(BOOKS_DIR, id + '.epub');
-  if (!fss.existsSync(file)) return res.status(404).end();
-  res.type('application/epub+zip').sendFile(file);
+  if (!fss.existsSync(file)) {
+    console.warn(`[books] GET ${id}: 404, no file on server`);
+    return res.status(404).end();
+  }
+  const t0 = Date.now();
+  res.type('application/epub+zip').sendFile(file, (err) => {
+    if (err) console.warn(`[books] GET ${id}: failed after ${Date.now() - t0} ms: ${err.message}`);
+    else console.log(`[books] GET ${id}: sent ${db.books[id]?.title || ''} in ${Date.now() - t0} ms`);
+  });
 });
 
 app.delete('/api/books/:id', async (req, res) => {
