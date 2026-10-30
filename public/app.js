@@ -558,7 +558,8 @@ async function openBook(id) {
   flatToc = [];
   (function walk(items, depth) {
     for (const it of items) {
-      flatToc.push({ label: (it.label || '').trim(), href: it.href, depth, idx: book.spine.get(it.href)?.index ?? -1 });
+      const href = resolveTocHref(it.href);
+      flatToc.push({ label: (it.label || '').trim(), href, depth, idx: href ? book.spine.get(href)?.index ?? -1 : -1 });
       if (it.subitems?.length) walk(it.subitems, depth + 1);
     }
   })(nav.toc || [], 0);
@@ -828,7 +829,8 @@ async function jumpTo(target, { remember = true } = {}) {
   if (remember && currentLoc) { backStack.push(currentLoc.start.cfi); $('#btn-back').hidden = false; }
   navSource = 'jump';
   lastLocalNav = Date.now();
-  try { await rendition.display(target); } catch (e) { toast('Could not open that location'); }
+  try { await rendition.display(target); }
+  catch (e) { console.warn('jump', target, e); toast(`Could not open that location (${e?.message || e}).`); }
 }
 function goBack() {
   const cfi = backStack.pop();
@@ -905,12 +907,47 @@ function updateStatus() {
   if (showFar) $('#btn-furthest').textContent = `Furthest read (${pctStr(far)}) ›`;
 }
 
+// Contents links are written relative to the nav/NCX file, but epub.js looks them up relative to the
+// package (OPF) folder. When those differ (e.g. Nav/toc.xhtml linking to ../Text/ch1.xhtml), or the
+// link is URL-encoded differently from the manifest, the lookup fails. Map each link to its spine item.
+function resolveTocHref(href) {
+  if (!href) return null;
+  const hashAt = href.indexOf('#');
+  const path = hashAt >= 0 ? href.slice(0, hashAt) : href;
+  const frag = hashAt >= 0 ? href.slice(hashAt) : '';
+  const get = (p) => { try { return p ? book.spine.get(p) : null; } catch { return null; } };
+  const dec = (p) => { try { return decodeURIComponent(p); } catch { return p; } };
+  let sec = get(path) || get(dec(path)) || get(encodeURI(dec(path)));
+  if (!sec) {
+    // resolve relative to the nav document's folder (paths are relative to the OPF folder)
+    const navPath = book.packaging?.navPath || book.packaging?.ncxPath || '';
+    try {
+      const resolved = new URL(path, 'http://book/' + navPath).pathname.slice(1);
+      sec = get(resolved) || get(dec(resolved));
+    } catch {}
+  }
+  if (!sec && path) {
+    // last resort: the spine item whose path shares the longest tail with the link
+    const want = dec(path).split('/').filter((x) => x && x !== '.' && x !== '..');
+    let bestN = 0;
+    book.spine.each((item) => {
+      const have = dec(item.href).split('/');
+      let n = 0;
+      while (n < want.length && n < have.length && want[want.length - 1 - n] === have[have.length - 1 - n]) n++;
+      if (n > bestN) { bestN = n; sec = item; }
+    });
+  }
+  if (!sec) return path ? null : href; // a bare '#id' stays as is
+  return sec.href + frag;
+}
+
 function renderToc() {
   const ul = $('#toc-list');
   ul.replaceChildren(...flatToc.map((t) => el('li', {},
     el('a', {
       href: '#', 'data-idx': t.idx, style: `padding-left:${10 + t.depth * 16}px`,
-      onclick: (e) => { e.preventDefault(); closeDrawers(); jumpTo(t.href); },
+      class: t.href ? '' : 'missing', title: t.href ? null : 'This entry points to a file that is not in the book',
+      onclick: (e) => { e.preventDefault(); closeDrawers(); if (t.href) jumpTo(t.href); else toast('This contents entry points to a part of the book that is missing from the EPUB.'); },
     }, t.label || '(untitled)'))));
 }
 function highlightTocCurrent() {
