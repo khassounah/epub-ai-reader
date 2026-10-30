@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Reader</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="theme-color" content="#f7f5f0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-theme="light">
+  <header id="topbar">
+    <button id="btn-library" class="ghost" title="Library (L)">Library</button>
+    <button id="btn-toc" class="ghost" title="Contents (T)" disabled>Contents</button>
+    <div id="book-title" class="truncate"></div>
+    <span id="sync-status" title="Sync status"></span>
+    <button id="btn-settings" class="ghost" title="Settings">Settings</button>
+    <button id="btn-chat" class="ghost" title="Chat (C)" disabled>Chat</button>
+  </header>
+
+  <main id="main">
+    <section id="reader-wrap">
+      <button class="nav prev" id="prev" title="Previous page (←)" aria-label="Previous page">‹</button>
+      <div id="viewer"></div>
+      <button class="nav next" id="next" title="Next page (→)" aria-label="Next page">›</button>
+      <div id="empty-state">
+        <h2>No book open</h2>
+        <p>Add an EPUB to your library. It syncs to your server and stays available on this device offline.</p>
+        <label class="btn primary">Add EPUB<input type="file" accept=".epub,application/epub+zip" multiple hidden class="file-input"></label>
+      </div>
+    </section>
+
+    <aside id="chat-panel" hidden>
+      <div class="chat-head">
+        <button id="chat-back" class="ghost small" hidden>‹ All chats</button>
+        <strong id="chat-heading">Chats</strong>
+        <select id="chat-provider" title="Model"></select>
+        <button id="chat-close" class="ghost small" title="Close">✕</button>
+      </div>
+      <div id="chat-list-view">
+        <div class="new-chat-row">
+          <button id="new-general" class="btn">New chat · General</button>
+          <button id="new-page" class="btn">New chat · This page</button>
+        </div>
+        <p class="hint">Select text in the book to ask about a highlight.</p>
+        <ul id="chat-list"></ul>
+      </div>
+      <div id="chat-thread-view" hidden>
+        <div id="chat-context"></div>
+        <div id="chat-messages"></div>
+        <form id="chat-form">
+          <textarea id="chat-input" rows="2" placeholder="Ask a question…  (Enter to send, Shift+Enter for newline)"></textarea>
+          <button type="submit" id="chat-send" class="btn primary">Send</button>
+        </form>
+      </div>
+    </aside>
+  </main>
+
+  <footer id="statusbar">
+    <input type="range" id="scrubber" min="0" max="1000" value="0" disabled aria-label="Book position">
+    <div class="status-row">
+      <span id="chapter-name" class="truncate"></span>
+      <span id="page-info"></span>
+      <span class="status-actions">
+        <button id="btn-back" class="ghost small" hidden title="Return to where you were before the jump">↩ Back</button>
+        <button id="btn-furthest" class="ghost small" hidden>Furthest read ›</button>
+      </span>
+    </div>
+  </footer>
+
+  <div id="selection-pop" hidden>
+    <button id="ask-selection" class="btn primary small">Ask about this</button>
+  </div>
+
+  <div id="scrim" hidden></div>
+
+  <nav id="drawer-library" class="drawer" hidden>
+    <div class="drawer-head">
+      <strong>Library</strong>
+      <label class="btn primary small">Add EPUB<input type="file" accept=".epub,application/epub+zip" multiple hidden class="file-input"></label>
+    </div>
+    <ul id="library-list"></ul>
+  </nav>
+
+  <nav id="drawer-toc" class="drawer" hidden>
+    <div class="drawer-head"><strong>Contents</strong></div>
+    <ul id="toc-list"></ul>
+  </nav>
+
+  <dialog id="dlg-settings">
+    <form method="dialog" class="settings">
+      <h2>Settings</h2>
+
+      <section>
+        <h3>Reading</h3>
+        <div class="row">
+          <label>Theme
+            <select id="pref-theme">
+              <option value="light">Light</option>
+              <option value="sepia">Sepia</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <label>Text size
+            <input type="range" id="pref-size" min="70" max="200" step="5">
+            <span id="pref-size-val"></span>
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h3>AI providers</h3>
+        <p class="hint">Keys are stored on your server and on each of your devices, so they work offline from the server and you only enter them once. Requests go straight from this browser to the provider.</p>
+        <div id="provider-list"></div>
+        <div class="row">
+          <select id="provider-preset">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="gemini">Google Gemini (OpenAI-compatible)</option>
+            <option value="ollama">Ollama (local)</option>
+            <option value="custom">Custom OpenAI-compatible</option>
+          </select>
+          <button type="button" id="provider-add" class="btn">Add provider</button>
+        </div>
+      </section>
+
+      <section>
+        <h3>Device</h3>
+        <p class="hint" id="device-info"></p>
+      </section>
+
+      <div class="dialog-actions">
+        <button type="button" id="settings-save" class="btn primary">Save</button>
+        <button value="cancel" class="btn">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" hidden></div>
+  <div id="drop-overlay" hidden>Drop EPUB files to add them</div>
+
+  <script src="/lib/jszip.min.js"></script>
+  <script src="/lib/epub.min.js"></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
