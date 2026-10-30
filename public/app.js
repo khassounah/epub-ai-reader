@@ -31,7 +31,15 @@ const idb = (() => {
         if (!d.objectStoreNames.contains(name)) d.createObjectStore(name, opts);
       }
     };
-    r.onsuccess = () => res(r.result);
+    // A tab still running an older version keeps the database open and blocks the upgrade.
+    r.onblocked = () => toast('Updating this device’s storage. Close or reload other tabs of the reader in this browser to continue.', null, null, 0);
+    r.onsuccess = () => {
+      const db = r.result;
+      // when a newer version opens the database in another tab, step aside and reload into it
+      db.onversionchange = () => { db.close(); location.reload(); };
+      if (!$('#toast').hidden && /Updating this device/.test($('#toast').textContent)) $('#toast').hidden = true;
+      res(db);
+    };
     r.onerror = () => rej(r.error);
   }));
   async function run(store, mode, fn) {
@@ -419,12 +427,13 @@ async function removeLocalBook(id, queueDelete = true) {
   renderLibrary();
 }
 
+let libraryGen = 0;
 async function renderLibrary() {
-  const list = $('#library-list');
+  const gen = ++libraryGen;
+  const list = document.createElement('ul');
   const have = new Set(await idb.keys('files').catch(() => []));
   const books = Object.values(S.books).sort((a, b) => (S.progress[b.id]?.updatedAt || b.addedAt) - (S.progress[a.id]?.updatedAt || a.addedAt));
-  list.replaceChildren();
-  if (!books.length) { list.append(el('li', { class: 'hint' }, 'No books yet.')); return; }
+  if (!books.length) list.append(el('li', { class: 'hint' }, 'No books yet.'));
   for (const b of books) {
     const p = S.progress[b.id] || {};
     const cover = await idb.get('kv', 'cover:' + b.id).catch(() => null);
@@ -433,13 +442,14 @@ async function renderLibrary() {
       el('div', { class: 'book-meta' },
         el('div', { class: 't truncate' }, b.title),
         el('div', { class: 'a truncate' }, b.author || ' '),
-        el('div', { class: 'p' }, `${pctStr(p.percent)} · furthest ${pctStr(p.furthestPercent)}${have.has(b.id) ? '' : ' · not downloaded'}`),
+        el('div', { class: 'p' }, `${pctStr(p.percent)} · furthest ${pctStr(p.furthestPercent)}${have.has(b.id) ? '' : downloads.has(b.id) ? ' · downloading…' : ' · not downloaded'}`),
         el('div', { class: 'bar' }, el('b', { style: `width:${(p.furthestPercent || 0) * 100}%` }), el('i', { style: `width:${(p.percent || 0) * 100}%` }))),
       el('button', {
         class: 'ghost small', title: 'Remove from library (all devices)',
         onclick: (e) => { e.stopPropagation(); if (confirm(`Remove "${b.title}" from all devices? Its chats are removed too.`)) { removeLocalBook(b.id); sync(); } },
       }, '✕')));
   }
+  if (gen === libraryGen) $('#library-list').replaceChildren(...list.childNodes); // a newer render supersedes this one
 }
 
 // ---------------------------------------------------------------- reader
