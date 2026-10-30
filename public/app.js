@@ -24,12 +24,12 @@ const pctStr = (p) => (p == null ? '—' : `${Math.round(p * 1000) / 10}%`);
 const idb = (() => {
   let dbp;
   const open = () => (dbp ||= new Promise((res, rej) => {
-    const r = indexedDB.open('epub-reader', 1);
+    const r = indexedDB.open('epub-reader', 2);
     r.onupgradeneeded = () => {
       const d = r.result;
-      d.createObjectStore('kv');
-      d.createObjectStore('files');
-      d.createObjectStore('outbox', { keyPath: 'key' });
+      for (const [name, opts] of [['kv'], ['files'], ['outbox', { keyPath: 'key' }], ['parts']]) {
+        if (!d.objectStoreNames.contains(name)) d.createObjectStore(name, opts);
+      }
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -50,6 +50,7 @@ const idb = (() => {
     del: (s, k) => run(s, 'readwrite', (o) => o.delete(k)),
     all: (s) => run(s, 'readonly', (o) => o.getAll()),
     keys: (s) => run(s, 'readonly', (o) => o.getAllKeys()),
+    delPrefix: (s, prefix) => run(s, 'readwrite', (o) => o.delete(IDBKeyRange.bound(prefix, prefix + '\uffff'))),
   };
 })();
 
@@ -218,18 +219,45 @@ async function downloadMissing() {
 // One download per book at a time (background sync and opening the book share it), streamed so we can
 // show progress, abort if the server stops sending, and report the real cause when it fails.
 const downloads = new Map(); // id -> { promise, loaded, total, attempt }
-const partial = new Map(); // id -> bytes kept from a failed download, so Retry resumes
+// Partial downloads are saved to IndexedDB in ~4 MB parts as they arrive ('parts' store, keys
+// `<id>:<seq>`; progress in kv `dl:<id>`), so a dropped connection, a refresh, or closing the app
+// resumes from the last saved part with an HTTP Range request.
 const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
 const STALL_MS = 30000;
+const PART_BYTES = 4 * 1048576;
+const partKey = (id, n) => `${id}:${String(n).padStart(6, '0')}`;
+async function clearPartial(id) {
+  await idb.delPrefix('parts', id + ':').catch(() => {});
+  await idb.del('kv', 'dl:' + id).catch(() => {});
+}
+
 function downloadBook(id) {
   const existing = downloads.get(id);
   if (existing) return existing.promise;
-  const d = { loaded: 0, total: S.books[id]?.size || 0, attempt: 0 };
-  const chunks = [];
+  const d = { loaded: 0, total: S.books[id]?.size || 0, attempt: 0, receiving: false };
   const MAX_ATTEMPTS = 6;
+  let saved = { loaded: 0, parts: 0, total: 0 }; // what is safely in IndexedDB
+  let pending = [], pendingBytes = 0, flushChain = Promise.resolve();
 
-  // One HTTP attempt. Resumes from d.loaded with a Range request, so a dropped connection on a
-  // large book continues where it stopped instead of starting over.
+  const flush = () => {
+    if (!pendingBytes) return flushChain;
+    const blob = new Blob(pending), bytes = pendingBytes;
+    pending = []; pendingBytes = 0;
+    flushChain = flushChain.then(async () => {
+      await idb.set('parts', partKey(id, saved.parts), blob);
+      saved = { loaded: saved.loaded + bytes, parts: saved.parts + 1, total: d.total };
+      await idb.set('kv', 'dl:' + id, saved);
+    });
+    return flushChain;
+  };
+  const restart = async () => {
+    pending = []; pendingBytes = 0;
+    await flushChain.catch(() => {});
+    await clearPartial(id);
+    saved = { loaded: 0, parts: 0, total: 0 };
+    d.loaded = 0;
+  };
+
   async function attempt() {
     const ctrl = new AbortController();
     let stallT, stalled = false;
@@ -241,20 +269,24 @@ function downloadBook(id) {
       try { r = await fetch(`/api/books/${id}/file`, { signal: ctrl.signal, cache: 'no-store', headers }); }
       catch (e) { throw Object.assign(new Error(stalled ? 'stalled' : `can't reach the server (${e.message})`), { retry: true }); }
       if (r.status === 404) {
+        await restart();
         throw new Error("The server doesn't have this book's file (HTTP 404). Open the reader on the device you added it from so it can upload, or add the EPUB again.");
       }
+      if (r.status === 416) { await restart(); throw Object.assign(new Error('saved partial download no longer matches the server'), { retry: true }); }
       if (!r.ok) throw Object.assign(new Error(`server returned HTTP ${r.status}`), { retry: r.status >= 500 });
-      if (d.loaded && r.status !== 206) { chunks.length = 0; d.loaded = 0; } // server ignored the range: start over
+      if (d.loaded && r.status !== 206) await restart(); // server ignored the range: start over
       if (!d.loaded) d.total = Number(r.headers.get('content-length')) || d.total;
       const reader = r.body.getReader();
       try {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
-          chunks.push(value);
+          pending.push(value);
+          pendingBytes += value.length;
           d.loaded += value.length;
           d.receiving = true;
           arm();
+          if (pendingBytes >= PART_BYTES) flush();
         }
       } catch (e) {
         throw Object.assign(new Error(stalled ? 'stalled' : `connection dropped (${e.message})`), { retry: true });
@@ -262,40 +294,59 @@ function downloadBook(id) {
       if (d.total && d.loaded < d.total) throw Object.assign(new Error('connection closed early'), { retry: true });
     } finally {
       clearTimeout(stallT);
+      await flush().catch(() => {}); // keep whatever arrived, even on failure
     }
   }
 
-  // resume a previous failed attempt from this session
-  const prev = partial.get(id);
-  if (prev) { chunks.push(...prev.chunks); d.loaded = prev.loaded; d.total = prev.total; partial.delete(id); }
+  async function run() {
+    if (await idb.get('files', id)) return; // another tab finished it
+    const prev = await idb.get('kv', 'dl:' + id);
+    if (prev?.loaded && (!d.total || prev.total === d.total)) {
+      saved = prev;
+      d.loaded = prev.loaded;
+      d.total = prev.total || d.total;
+    } else if (prev) await clearPartial(id);
+
+    for (;;) {
+      d.attempt++;
+      d.receiving = false;
+      try { await attempt(); break; }
+      catch (e) {
+        d.receiving = false;
+        d.loaded = saved.loaded; // resume from what is safely stored
+        if (!e.retry) throw e;
+        if (d.attempt >= MAX_ATTEMPTS) {
+          const why = e.message === 'stalled' ? `no data from the server for ${STALL_MS / 1000} s` : e.message;
+          throw new Error(`Download failed after ${MAX_ATTEMPTS} tries (${why}). Got ${mb(d.loaded)}${d.total ? ' of ' + mb(d.total) : ''}; Retry continues from there.`);
+        }
+        await new Promise((res) => setTimeout(res, Math.min(10000, 1500 * d.attempt)));
+      }
+    }
+    await flushChain;
+    const parts = [];
+    for (let i = 0; i < saved.parts; i++) {
+      const part = await idb.get('parts', partKey(id, i));
+      if (!part) { await restart(); throw new Error('A saved piece of the download was missing; Retry downloads it again.'); }
+      parts.push(part);
+    }
+    const blob = new Blob(parts, { type: 'application/epub+zip' });
+    if (d.total && blob.size !== d.total) {
+      await restart();
+      throw new Error(`Download incomplete: got ${mb(blob.size)} of ${mb(d.total)}. Retry downloads it again.`);
+    }
+    try { await idb.set('files', id, blob); }
+    catch (e) { throw new Error(`Downloaded, but couldn't save it on this device (${e.name || e.message}). Browser storage may be full or blocked, e.g. in a private window.`); }
+    await clearPartial(id);
+    // Cover from a big book means parsing it a second time; for those, the cover is made when it's opened.
+    if (blob.size < 30 * 1048576) blob.arrayBuffer().then((buf) => makeCover(id, buf)).then(renderLibrary);
+    renderLibrary();
+  }
+
   d.promise = (async () => {
     try {
-      for (;;) {
-        d.attempt++;
-        try { await attempt(); break; }
-        catch (e) {
-          d.receiving = false;
-          if (!e.retry) throw e;
-          if (d.attempt >= MAX_ATTEMPTS) {
-            const why = e.message === 'stalled' ? `no data from the server for ${STALL_MS / 1000} s` : e.message;
-            throw new Error(`Download failed after ${MAX_ATTEMPTS} tries (${why}). Got ${mb(d.loaded)}${d.total ? ' of ' + mb(d.total) : ''}; Retry continues from there.`);
-          }
-          await new Promise((res) => setTimeout(res, Math.min(10000, 1500 * d.attempt)));
-        }
-      }
-      const blob = new Blob(chunks, { type: 'application/epub+zip' });
-      chunks.length = 0;
-      if (d.total && blob.size !== d.total) throw new Error(`Download incomplete: got ${mb(blob.size)} of ${mb(d.total)}.`);
-      try { await idb.set('files', id, blob); }
-      catch (e) { throw new Error(`Downloaded, but couldn't save it on this device (${e.name || e.message}). Browser storage may be full or blocked, e.g. in a private window.`); }
-      partial.delete(id);
-      // Cover from a big book means parsing it a second time; for those, the cover is made when it's opened.
-      if (blob.size < 30 * 1048576) blob.arrayBuffer().then((buf) => makeCover(id, buf)).then(renderLibrary);
-      renderLibrary();
-    } catch (e) {
-      // keep what we have so Retry resumes instead of starting from zero
-      if (d.loaded) partial.set(id, { chunks: chunks.slice(), loaded: d.loaded, total: d.total });
-      throw e;
+      // one tab at a time per book; a second tab waits, then finds the finished file
+      if (navigator.locks) await navigator.locks.request('download:' + id, run);
+      else await run();
     } finally {
       downloads.delete(id);
     }
@@ -358,6 +409,7 @@ async function removeLocalBook(id, queueDelete = true) {
   S.deleted[id] = Date.now();
   for (const c of Object.values(S.conversations)) if (c.bookId === id) Object.assign(c, { deleted: true, updatedAt: Date.now() });
   await idb.del('files', id).catch(() => {});
+  await clearPartial(id);
   await idb.del('kv', 'cover:' + id).catch(() => {});
   await idb.del('kv', 'loc:' + id).catch(() => {});
   if (outboxKeys.has('upload:' + id)) { await idb.del('outbox', 'upload:' + id); outboxKeys.delete('upload:' + id); }
