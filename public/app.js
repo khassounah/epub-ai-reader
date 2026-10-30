@@ -1,7 +1,7 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '12';
+const APP_VERSION = '13';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 // set by the service worker when this page came from the saved copy instead of the server
 const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
@@ -628,6 +628,7 @@ function registerThemes() {
     'html, body': { orphans: '1 !important', widows: '1 !important' },
     '[data-rd-anchor]::before': { content: '""', display: 'block', height: 'var(--rd-gap, 0px)' },
   });
+  rendition.themes.default({ 'img, svg image': { cursor: 'zoom-in' } });
   const base = { 'line-height': '1.6' };
   rendition.themes.register('light', { body: { ...base, background: '#fbfaf7 !important', color: '#1d1c1a !important' } });
   rendition.themes.register('sepia', { body: { ...base, background: '#f6ecd6 !important', color: '#3b2f22 !important' } });
@@ -845,11 +846,24 @@ function attachContentHandlers(contents) {
     if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && Date.now() - t0 < 800) dx < 0 ? next() : prev();
   }, { passive: true });
   doc.addEventListener('mousedown', () => hideSelectionPop());
+  doc.addEventListener('click', (e) => {
+    const img = e.target.closest?.('img, image');
+    if (!img || e.target.closest('a[href]') || doc.getSelection()?.toString()) return;
+    const r = img.getBoundingClientRect();
+    if (r.width < 40 && r.height < 40) return; // inline icons, bullets
+    const src = img.localName === 'image' ? (img.getAttribute('href') || img.getAttribute('xlink:href') || img.getAttributeNS('http://www.w3.org/1999/xlink', 'href')) : img.currentSrc || img.src;
+    if (!src) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const fig = img.closest('figure');
+    const caption = (fig?.querySelector('figcaption')?.textContent || img.getAttribute('alt') || img.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    openLightbox(new URL(src, doc.baseURI).href, caption);
+  });
   doc.addEventListener('selectionchange', () => { if (!doc.getSelection()?.toString().trim()) hideSelectionPop(); });
 }
 
 function onKey(e) {
-  if (e.target?.closest?.('textarea, input, select')) return;
+  if (e.target?.closest?.('textarea, input, select') || !$('#lightbox').hidden) return;
   if (e.key === 'ArrowRight' || e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) next();
   else if (e.key === 'ArrowLeft' || e.key === 'PageUp' || (e.key === ' ' && e.shiftKey)) prev();
 }
@@ -1428,6 +1442,120 @@ function saveSettings() {
   sync();
 }
 
+// ---------------------------------------------------------------- image viewer
+// Full-screen view of a book image: wheel / pinch / double-click to zoom, drag to pan.
+const lb = { scale: 1, fit: 1, x: 0, y: 0, w: 0, h: 0, pointers: new Map(), pinch: null, drag: null, lastTap: 0 };
+function lbApply() {
+  $('#lb-img').style.transform = `translate(${lb.x}px, ${lb.y}px) scale(${lb.scale})`;
+  $('#lb-zoom').textContent = Math.round(lb.scale * 100) + '%';
+}
+function lbClamp() {
+  const st = $('#lb-stage').getBoundingClientRect();
+  const iw = lb.w * lb.scale, ih = lb.h * lb.scale;
+  // centred when smaller than the screen; otherwise no empty space at the edges
+  lb.x = iw <= st.width ? (st.width - iw) / 2 : Math.min(0, Math.max(st.width - iw, lb.x));
+  lb.y = ih <= st.height ? (st.height - ih) / 2 : Math.min(0, Math.max(st.height - ih, lb.y));
+}
+function lbZoomTo(scale, cx, cy) {
+  const st = $('#lb-stage').getBoundingClientRect();
+  cx ??= st.width / 2; cy ??= st.height / 2;
+  scale = Math.min(Math.max(scale, Math.min(lb.fit, 1) * 0.5), Math.max(8, lb.fit * 4));
+  // keep the point under the cursor/fingers fixed
+  lb.x = cx - ((cx - lb.x) * scale) / lb.scale;
+  lb.y = cy - ((cy - lb.y) * scale) / lb.scale;
+  lb.scale = scale;
+  lbClamp();
+  lbApply();
+}
+function lbFit() {
+  const st = $('#lb-stage').getBoundingClientRect();
+  lb.fit = Math.min((st.width - 24) / lb.w, (st.height - 24) / lb.h, 2); // small images are enlarged up to 2x
+  lb.scale = lb.fit;
+  lbClamp();
+  lbApply();
+}
+async function openLightbox(src, caption) {
+  const img = $('#lb-img');
+  img.src = src;
+  $('#lb-caption').textContent = caption;
+  $('#lightbox').hidden = false;
+  try { await img.decode(); } catch { $('#lightbox').hidden = true; toast("Couldn't open that image."); return; }
+  lb.w = img.naturalWidth || 300;
+  lb.h = img.naturalHeight || 300;
+  lbFit();
+}
+function closeLightbox() { $('#lightbox').hidden = true; $('#lb-img').removeAttribute('src'); lb.pointers.clear(); }
+
+function wireLightbox() {
+  const stage = $('#lb-stage');
+  $('#lb-close').onclick = closeLightbox;
+  $('#lb-fit').onclick = lbFit;
+  $('#lb-actual').onclick = () => lbZoomTo(1);
+  const local = (e) => { const r = stage.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  stage.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const [cx, cy] = local(e);
+    lbZoomTo(lb.scale * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0018)), cx, cy); // ctrlKey = trackpad pinch
+  }, { passive: false });
+  stage.addEventListener('pointerdown', (e) => {
+    stage.setPointerCapture(e.pointerId);
+    lb.pointers.set(e.pointerId, local(e));
+    if (lb.pointers.size === 2) {
+      const [a, b] = [...lb.pointers.values()];
+      lb.pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), scale: lb.scale };
+      lb.drag = null;
+    } else {
+      lb.drag = { x: e.clientX, y: e.clientY, ox: lb.x, oy: lb.y, moved: false };
+      stage.classList.add('dragging');
+    }
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!lb.pointers.has(e.pointerId)) return;
+    lb.pointers.set(e.pointerId, local(e));
+    if (lb.pinch && lb.pointers.size === 2) {
+      const [a, b] = [...lb.pointers.values()];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      lbZoomTo(lb.pinch.scale * (d / lb.pinch.d), (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+    } else if (lb.drag) {
+      const dx = e.clientX - lb.drag.x, dy = e.clientY - lb.drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) lb.drag.moved = true;
+      lb.x = lb.drag.ox + dx; lb.y = lb.drag.oy + dy;
+      lbClamp(); lbApply();
+    }
+  });
+  const end = (e) => {
+    const wasTap = lb.drag && !lb.drag.moved && lb.pointers.size === 1;
+    lb.pointers.delete(e.pointerId);
+    if (lb.pointers.size < 2) lb.pinch = null;
+    if (!lb.pointers.size) { stage.classList.remove('dragging'); lb.drag = null; }
+    if (!wasTap) return;
+    const [cx, cy] = local(e);
+    const now = Date.now();
+    if (now - lb.lastTap < 300) { // double tap / double click: toggle fit <-> zoomed in
+      lb.lastTap = 0;
+      if (lb.scale > lb.fit * 1.05) lbFit(); else lbZoomTo(Math.max(lb.fit * 2.5, 1), cx, cy);
+      return;
+    }
+    lb.lastTap = now;
+    // single tap on the backdrop (outside the image) closes
+    const r = $('#lb-img').getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+      setTimeout(() => { if (lb.lastTap === now) closeLightbox(); }, 300);
+    }
+  };
+  stage.addEventListener('pointerup', end);
+  stage.addEventListener('pointercancel', end);
+  document.addEventListener('keydown', (e) => {
+    if ($('#lightbox').hidden) return;
+    if (e.key === 'Escape') { e.stopPropagation(); closeLightbox(); }
+    else if (e.key === '+' || e.key === '=') lbZoomTo(lb.scale * 1.25);
+    else if (e.key === '-') lbZoomTo(lb.scale / 1.25);
+    else if (e.key === '0') lbFit();
+    else if (e.key === '1') lbZoomTo(1);
+  }, true);
+  window.addEventListener('resize', () => { if (!$('#lightbox').hidden) lbFit(); });
+}
+
 // ---------------------------------------------------------------- UI chrome
 let toastT;
 // ms: auto-hide delay; 0 = stays until replaced or dismissed
@@ -1444,6 +1572,7 @@ function openDrawer(id) { closeDrawers(); $('#' + id).hidden = false; $('#scrim'
 function closeDrawers() { $$('.drawer').forEach((d) => (d.hidden = true)); $('#scrim').hidden = true; }
 
 function wireUI() {
+  wireLightbox();
   $('#btn-library').onclick = () => { renderLibrary(); openDrawer('drawer-library'); };
   $('#btn-toc').onclick = () => { openDrawer('drawer-toc'); $('#toc-list a.current')?.scrollIntoView({ block: 'center' }); };
   $('#scrim').onclick = closeDrawers;
@@ -1507,6 +1636,7 @@ function wireUI() {
   document.addEventListener('keydown', (e) => {
     if (e.target.closest('textarea, input, select, dialog')) return;
     if (e.key === 'Escape') { closeDrawers(); hideSelectionPop(); return; }
+    if (!$('#lightbox').hidden) return; // the viewer has its own keys
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === 'l') $('#btn-library').click();
     else if (e.key === 't' && book) $('#btn-toc').click();

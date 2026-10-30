@@ -64,3 +64,4 @@ WantedBy=multi-user.target
 - Ollama: set `OLLAMA_ORIGINS=*` (or your reader URL) so the browser may call it.
 - Backup = copy `data/`.
 - Keys: `←/→/Space` turn pages, `L` library, `T` contents, `C` chat, swipe on touch.
+- Images: click/tap to open full screen; wheel, pinch or double-click to zoom, drag to pan, `0` fit, `1` actual size, `Esc` to close.
