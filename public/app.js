@@ -1,7 +1,7 @@
 /* global ePub */
 // Offline-first EPUB reader. Everything lives in IndexedDB on this device and syncs to the server when reachable.
 
-const APP_VERSION = '17';
+const APP_VERSION = '18';
 const BUILD = document.querySelector('meta[name="reader-build"]')?.content || '';
 // set by the service worker when this page came from the saved copy instead of the server
 const LOADED_OFFLINE = document.querySelector('meta[name="reader-source"]')?.content === 'offline-copy';
@@ -1553,6 +1553,25 @@ function renderConnection() {
       el('button', { type: 'button', class: 'btn small', onclick: hardReload, title: 'Clears the saved copy of the app and loads it fresh from the server. Your books and data stay.' }, 'Reload app from server')));
 }
 
+// API key input. Deliberately NOT type="password": browsers treat any password field as a login and
+// offer to save it (ignoring autocomplete="off"). A text field masked with CSS avoids that; a saved key
+// is shown only as its last 4 characters until you choose to change it.
+function keyField(p) {
+  if (p.apiKey && !p._editingKey) {
+    return el('div', { class: 'key-field' }, el('span', { class: 'key-label' }, 'API key'),
+      el('div', { class: 'key-saved' }, el('code', {}, '••••••••' + p.apiKey.slice(-4)),
+        el('button', { type: 'button', class: 'ghost small', onclick: () => { p._editingKey = true; renderProviders(); } }, 'Change')));
+  }
+  const input = el('input', {
+    type: 'text', class: 'secret', value: p.apiKey || '', placeholder: 'Paste API key',
+    name: 'rd-key-' + p.id, autocomplete: 'off', autocorrect: 'off', autocapitalize: 'off', spellcheck: 'false',
+    'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', 'data-form-type': 'other',
+    oninput: (e) => { p.apiKey = e.target.value.trim(); },
+  });
+  if (p._editingKey) setTimeout(() => input.focus(), 0);
+  return el('label', {}, 'API key', input);
+}
+
 function renderProviders() {
   const box = $('#provider-list');
   if (!editProviders.length) { box.replaceChildren(el('p', { class: 'hint' }, 'No providers yet. Add one below.')); return; }
@@ -1567,7 +1586,7 @@ function renderProviders() {
         el('option', { value: 'openai', selected: p.type === 'openai' }, 'OpenAI-compatible'))),
       field('Base URL', 'baseUrl', 'url', 'full'),
       field('Model', 'model'),
-      field('API key', 'apiKey', 'password'),
+      keyField(p),
       field('Fallback model (optional, used when the main one is busy)', 'fallbackModel', 'text', 'full'),
       el('div', { class: 'actions' },
         el('label', {}, el('input', { type: 'radio', name: 'default-provider', checked: p.id === defId, onchange: () => { S._pendingDefault = p.id; } }), 'Default'),
@@ -1578,7 +1597,8 @@ function saveSettings() {
   const def = S._pendingDefault && editProviders.some((p) => p.id === S._pendingDefault) ? S._pendingDefault
     : editProviders.some((p) => p.id === S.settings.defaultProviderId) ? S.settings.defaultProviderId : editProviders[0]?.id || null;
   delete S._pendingDefault;
-  S.settings = { providers: editProviders, defaultProviderId: def, updatedAt: Date.now() };
+  const clean = editProviders.map((x) => Object.fromEntries(Object.entries(x).filter(([k]) => !k.startsWith('_'))));
+  S.settings = { providers: clean, defaultProviderId: def, updatedAt: Date.now() };
   markDirty('settings');
   const theme = $('#pref-theme').value, size = +$('#pref-size').value, columns = $('#pref-columns').value;
   if (theme !== S.prefs.theme || size !== S.prefs.fontSize || columns !== (S.prefs.columns || 'auto')) {
